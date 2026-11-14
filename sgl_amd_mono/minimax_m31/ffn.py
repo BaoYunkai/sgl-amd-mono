@@ -30,7 +30,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import const_expr, gpu
+from flydsl.expr import const_expr, gpu, ktrace
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
@@ -206,7 +206,8 @@ def scratch_layout(s: int) -> dict[str, tuple[int, int]]:
     out = dict(tagged)
     for name, nbytes in (
         ("sres", s * HIDDEN * 4),
-        ("xn", s * HIDDEN * 2),
+        # every B lane's chunks (``xn_at``), past S unused
+        ("xn", MAX_TOKENS * HIDDEN * 2),
         ("mid", slots(s) * 16 * INTER * 2),
         ("tl", BLOCKS * TL_POINTS * 8),
     ):
@@ -513,12 +514,17 @@ def stage_norm(c, t):
     # loads after it, one round trip each
     svs = [load_dev(c["sres"].value, t * HIDDEN + col, 2) for col in cols]
     for q in range_constexpr(len(cols)):
-        store_dev(
-            c["xn"].value,
-            t * (HIDDEN // 2) + cols[q] // 2,
-            xn_math(svs[q], ws[q], rstd),
-        )
+        store_dev(c["xn"].value, xn_at(t, cols[q]), xn_math(svs[q], ws[q], rstd))
     flag_after_stores(c, c["xrdy"], t, tid == 0)
+
+
+def xn_at(t, col):
+    """XN's dword of token t, columns col, col + 1 (col even). XN is kept in the up
+    MFMA's B order: 16-byte chunk (step, d, lane g * 16 + t) holds columns
+    128 step + 32 g + 8 d .., so each B load of a wave reads 1 KiB contiguous."""
+    st, k = col // 128, col % 128
+    lane = (k // 32) * 16 + t
+    return ((st * 4 + k % 32 // 8) * 64 + lane) * 4 + k % 8 // 2
 
 
 def norm_weight(c, col, n):
@@ -569,23 +575,29 @@ def x_zero():
     ]
 
 
+def xn_operands(c):
+    """The lane's B operands of its wave's up steps from XN (``xn_at``'s order)."""
+    st0 = c["wave"] * UP_WAVE_STEPS
+    return [
+        [
+            load_dev(c["xn"].value, ((st0 + i) * 4 + d) * 256 + c["lane"] * 4, 4)
+            for d in range(4)
+        ]
+        for i in range(UP_WAVE_STEPS)
+    ]
+
+
 @flyc.jit
 def x_regs(c):
     """The lane's B operands of its wave's up steps for token ``lane % 16``: with
     every slot's MFMA columns in token order these are the CTA's X for all of its
     up units, loaded once. Columns past S stay zero; ``stage_up`` stores only its
     slot's tokens."""
-    s = c["S"]
-    st0 = c["wave"] * UP_WAVE_STEPS
-    if const_expr(s == MAX_TOKENS):
-        return x_operands(
-            c, c["xn"].value, c["lane"] % 16, HIDDEN // 2, st0, UP_WAVE_STEPS
-        )
+    if const_expr(c["S"] == MAX_TOKENS):
+        return xn_operands(c)
     xs = x_zero()
-    if c["lane"] % 16 < s:
-        xs = x_operands(
-            c, c["xn"].value, c["lane"] % 16, HIDDEN // 2, st0, UP_WAVE_STEPS
-        )
+    if c["lane"] % 16 < c["S"]:
+        xs = xn_operands(c)
     return xs
 
 
@@ -1100,28 +1112,37 @@ def stamp(c, k):
             )
 
 
+def stage_mark(c, k):
+    """Stage boundary k: the timeline stamp and, in a ktrace build, the end of
+    stage k - 1's range and the start of stage k's."""
+    stamp(c, k)
+    if c.get("kt") is not None:
+        ktrace.range_stop(c["kt"])
+    c["kt"] = ktrace.range_start(TL_STAGES[k]) if k < len(TL_STAGES) else None
+
+
 @flyc.jit
 def run_ffn(c, bid):
     s = c["S"]
-    stamp(c, 0)
+    stage_mark(c, 0)
     for task in range(first_task(bid, 0), SEAM_TASKS, BLOCKS):
         stage_push(c, task)
     gpu.barrier()
-    stamp(c, 1)
+    stage_mark(c, 1)
     for task in range(first_task(bid, 0), SEAM_TASKS, BLOCKS):
         stage_reduce(c, task)
     gpu.barrier()
-    stamp(c, 2)
+    stage_mark(c, 2)
     for t in range(first_task(bid, NORM0), s, BLOCKS):
         stage_norm(c, t)
-    stamp(c, 3)
+    stage_mark(c, 3)
     for task in range(first_task(bid, ROUTER0), ROUTER_TASKS, BLOCKS):
         stage_router(c, task)
-    stamp(c, 4)
+    stage_mark(c, 4)
     for t in range(first_task(bid, NORM0), s, BLOCKS):
         stage_route(c, t)
     gpu.barrier()
-    stamp(c, 5)
+    stage_mark(c, 5)
     sh = first_task(bid, SHARED0)
     # a shared CTA's weights go out before its XRDY wait; zero-sized elsewhere
     live = fx.Int64(uniform((sh < UP_TILES).select(fx.Int32(-1), fx.Int32(0))))
@@ -1135,25 +1156,25 @@ def run_ffn(c, bid):
     if sh < UP_TILES:
         shared_slot(c)
         stage_up(c, 0, sh, weights, xs, shared=True)
-    stamp(c, 6)
+    stage_mark(c, 6)
     load_table(c)
     total = (n_slots(c) - 1) * UP_TILES
     first = first_task(bid, ROUTED0)
     weights = unit_weights(c, first)
-    stamp(c, 7)
+    stage_mark(c, 7)
     for unit in range(first, total, BLOCKS):
         weights = stage_up(
             c, 1 + unit // UP_TILES, unit % UP_TILES, weights, xs, nxt=unit + BLOCKS
         )
-    stamp(c, 8)
+    stage_mark(c, 8)
     if bid < DOWN_TASKS - BLOCKS:
         stage_down(c, [bid, bid + BLOCKS])
     else:
         stage_down(c, [bid])
-    stamp(c, 9)
+    stage_mark(c, 9)
     for task in range(first_task(bid, 0), FINAL_TASKS, BLOCKS):
         stage_final(c, task)
-    stamp(c, 10)
+    stage_mark(c, 10)
 
 
 def kernel_name(key: FfnBuild) -> str:
@@ -1280,7 +1301,7 @@ def build_ffn(key: FfnBuild):
                 c["vmask"] = valid_mask(c)
                 run_ffn(c, bid)
                 finish(c, key, epoch, ep, tag)
-                stamp(c, 11)
+                stage_mark(c, 11)
 
     @flyc.jit
     def launch(

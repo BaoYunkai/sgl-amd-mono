@@ -188,7 +188,10 @@ def _run(weights, s, seed=1):
     torch.cuda.synchronize()
     err = runner.epoch[list(guard.ERROR_WORDS)].tolist()
     assert not any(err), err
-    x = runner.region(s, "xn")[: s * H * 2].view(torch.bfloat16).view(s, H)
+    # XN in the up MFMA's B order (ffn.xn_at): chunk (step, d, g, t) of 8 columns
+    x = runner.region(s, "xn")[: ffn.MAX_TOKENS * H * 2].view(torch.bfloat16)
+    x = x.view(H // 128, 4, 4, ffn.MAX_TOKENS, 8).permute(3, 0, 2, 1, 4)
+    x = x.reshape(ffn.MAX_TOKENS, H)[:s]
     parts = _pairs(runner.region(s, "logit"), s * ffn.EXPERTS * ffn.ROUTER_PARTS)
     parts = parts.view(torch.float32).view(s, ffn.EXPERTS, ffn.ROUTER_PARTS)
     route = _pairs(runner.region(s, "route"), s * 2 * ffn.TOPK).view(s, 2 * ffn.TOPK)
