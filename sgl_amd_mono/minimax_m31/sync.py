@@ -41,7 +41,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, ktrace, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from sgl_amd_mono.common.sync import Space, _spin
@@ -280,7 +280,8 @@ class Mailbox:
                 bad = bad | (high_tag(v[e]) != tag)
             return bad
 
-        v = _spin(load_all, pending)
+        with ktrace.range(f"wait {specs[0][0].region}"):
+            v = _spin(load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
             if const_expr(triples):
