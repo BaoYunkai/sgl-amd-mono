@@ -1018,17 +1018,18 @@ def stage_slot_mid(c, u, cnt):
     row = INTER // 8
     n = cnt * row
     iters = -(-s * row // 64)
-    # six loads out at a time: the slot's down weights hold most registers
-    for b in range_constexpr(0, iters, 6):
+    # twelve loads out at a time: the slot's down weights hold most of the rest
+    # of the registers
+    for b in range_constexpr(0, iters, 12):
         words = []
-        for i in range_constexpr(b, min(b + 6, iters)):
+        for i in range_constexpr(b, min(b + 12, iters)):
             w = fx.Vector(_llvm.mlir_undef(T.vec(4, T.i32)))
             if i * 64 < n:
                 v = fx.min(lane + 64 * i, n - 1)
                 at = (u * 16 + v // row) * (INTER // 2) + v % row * 4
                 w = load_dev(c["mid"].value, at, 4)
             words.append(w)
-        for i in range_constexpr(b, min(b + 6, iters)):
+        for i in range_constexpr(b, min(b + 12, iters)):
             if i * 64 < n:
                 v = fx.min(lane + 64 * i, n - 1)
                 pick = tab_ld(c, T_SLOT_PICK + u * 16 + v // row)
