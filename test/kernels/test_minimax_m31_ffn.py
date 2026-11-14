@@ -239,16 +239,14 @@ def test_ffn_stages_match_native(weights, s):
 
 @pytest.mark.parametrize("s", [8, 16])
 def test_o_proj_is_sglangs_to_the_bit(weights, s):
-    """The launch's o_proj partial is SGLang's (AITER's per-token FP8 quant, then
-    ``smallm_fp8_gemm``) bit for bit, in both of that GEMM's wave splits."""
-    import aiter
+    """The launch's o_proj partial is SGLang's decode-sized o_proj on the rowwise-FP8
+    copy (``apply_fp8_ptpc_linear``) bit for bit."""
+    from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
 
-    smallm = pytest.importorskip("sglang.kernels.ops.gemm.smallm_fp8_gfx950")
-    if not smallm.smallm_fp8_gemm_enabled():
-        pytest.skip("smallm_fp8_gemm is off")
     r = _run(weights, s)
-    q, xs = aiter.per_token_quant_hip(r.attn, quant_dtype=aiter.dtypes.fp8)
-    want = smallm.smallm_fp8_gemm(q, weights.wo, xs, weights.wos, torch.bfloat16)
+    want = apply_fp8_ptpc_linear(
+        input=r.attn, weight=weights.wo, weight_scale=weights.wos, bias=None
+    )
     assert torch.equal(r.part, want)
 
 
