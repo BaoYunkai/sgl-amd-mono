@@ -55,7 +55,15 @@ from sgl_amd_mono.common.plan import THREADS, kernel_sources, key_tuple
 
 from .ffn import EPS, HIDDEN, INV_FP8_MAX, MAX_TOKENS
 from .nvfp4 import nvfp4_row
-from .sync import _ptr, cta_sync, load_dev, store32, store_dev, sync_acquire, sync_release
+from .sync import (
+    _ptr,
+    cta_sync,
+    load_dev,
+    store32,
+    store_dev,
+    sync_acquire,
+    sync_release,
+)
 
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
@@ -156,9 +164,13 @@ def cos_sin(a, pos, lane):
         cw = ld_i32(a["cs"], (pos * 64 + j) // 2)
         sw = ld_i32(a["cs"], (pos * 64 + ROPE_HALF + j) // 2)
         return bf_lo(cw), bf_hi(cw), bf_lo(sw), bf_hi(sw)
-    cv = fx.Vector(bo.buffer_load(rsrc(a["cs"]), pos * 64 + j, vec_width=2, dtype=T.f32))
+    cv = fx.Vector(
+        bo.buffer_load(rsrc(a["cs"]), pos * 64 + j, vec_width=2, dtype=T.f32)
+    )
     sv = fx.Vector(
-        bo.buffer_load(rsrc(a["cs"]), pos * 64 + ROPE_HALF + j, vec_width=2, dtype=T.f32)
+        bo.buffer_load(
+            rsrc(a["cs"]), pos * 64 + ROPE_HALF + j, vec_width=2, dtype=T.f32
+        )
     )
     return cv[0], cv[1], sv[0], sv[1]
 
@@ -171,9 +183,7 @@ def head_out(a, h, row, lane, yb0, yb1, loc, cs4, nw):
     ``cs4`` (the row's cos / sin) and ``nw`` (the head norm's weights) are loaded
     ahead."""
     if h == V_HEAD:
-        store_nvfp4(
-            a["vp"], a["vsc"], a["kv"], a["page"], loc, yb0, yb1, lane, True
-        )
+        store_nvfp4(a["vp"], a["vsc"], a["kv"], a["page"], loc, yb0, yb1, lane, True)
     else:
         ss = butterfly(yb0 * yb0 + yb1 * yb1, (32, 16, 8, 4, 2, 1))
         hr = hw_rsq(ss * fx.Float32(1.0 / HEAD) + fx.Float32(EPS))
@@ -201,13 +211,9 @@ def head_out(a, h, row, lane, yb0, yb1, loc, cs4, nw):
                 row * (HEAD // 2) + lane,
             )
         if h == K_HEAD:
-            store_nvfp4(
-                a["kp"], a["ksc"], a["kv"], a["page"], loc, o0, o1, lane, True
-            )
+            store_nvfp4(a["kp"], a["ksc"], a["kv"], a["page"], loc, o0, o1, lane, True)
         if h == IK_HEAD:
-            store_nvfp4(
-                a["ip"], a["isc"], a["ik"], a["page"], loc, o0, o1, lane, False
-            )
+            store_nvfp4(a["ip"], a["isc"], a["ik"], a["page"], loc, o0, o1, lane, False)
 
 
 @flyc.jit
@@ -310,11 +316,19 @@ def build_front(key: FrontBuild):
         nbytes = s * HIDDEN * 2
         rx, rr, rg = rsrc(x, nbytes), rsrc(res, nbytes), rsrc(norm_w)
         xw = [
-            fx.Vector(bo.buffer_load(rx, (t * HIDDEN + col) // 2 + 4 * j, vec_width=4, dtype=T.i32))
+            fx.Vector(
+                bo.buffer_load(
+                    rx, (t * HIDDEN + col) // 2 + 4 * j, vec_width=4, dtype=T.i32
+                )
+            )
             for j in range(2)
         ]
         rv = [
-            fx.Vector(bo.buffer_load(rr, (t * HIDDEN + col) // 2 + 4 * j, vec_width=4, dtype=T.i32))
+            fx.Vector(
+                bo.buffer_load(
+                    rr, (t * HIDDEN + col) // 2 + 4 * j, vec_width=4, dtype=T.i32
+                )
+            )
             for j in range(2)
         ]
         gv = [
@@ -330,7 +344,9 @@ def build_front(key: FrontBuild):
         rows = [fx.min(wave + 8 * k, s - 1) for k in ks]
         locs = [fx.Int32(sload64(loc + fx.Int64(8 * r))) for r in rows]
         poss = [fx.Int32(sload64(pos + fx.Int64(8 * r))) for r in rows]
-        ws2 = fx.Vector(bo.buffer_load(rsrc(ws), h * HEAD + 2 * lane, vec_width=2, dtype=T.f32))
+        ws2 = fx.Vector(
+            bo.buffer_load(rsrc(ws), h * HEAD + 2 * lane, vec_width=2, dtype=T.f32)
+        )
         nwp = (h < Q_HEADS).select(
             qn, (h == K_HEAD).select(kn, (h == IQ_HEAD).select(iqn, ikn))
         )
@@ -363,7 +379,9 @@ def build_front(key: FrontBuild):
         # past the X wait, so the positions are in: the rows' cos / sin
         css = [cos_sin(a, p_, lane) for p_ in poss]
         if (h == 0) & (t < s):
-            words = [bf16_pair(sv[2 * i], sv[2 * i + 1]).bitcast(fx.Int32) for i in range(8)]
+            words = [
+                bf16_pair(sv[2 * i], sv[2 * i + 1]).bitcast(fx.Int32) for i in range(8)
+            ]
             for j in range_constexpr(2):
                 bo.buffer_store(
                     fx.Vector.from_elements(words[4 * j : 4 * j + 4], fx.Int32),
@@ -383,7 +401,9 @@ def build_front(key: FrontBuild):
         qw = []
         for j in range_constexpr(4):
             vals = [
-                fx.min(fx.max(xg[4 * j + e] * inv, fx.Float32(-448.0)), fx.Float32(448.0))
+                fx.min(
+                    fx.max(xg[4 * j + e] * inv, fx.Float32(-448.0)), fx.Float32(448.0)
+                )
                 for e in range(4)
             ]
             qw.append(fp8_pack4(*vals))
@@ -401,7 +421,8 @@ def build_front(key: FrontBuild):
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for p in range_constexpr(STEPS // 2):
             a8 = fx.Vector.from_elements(
-                [fx.ptr_load(xa + ((p * 64 + lane) * 8 + e)) for e in range(8)], fx.Int32
+                [fx.ptr_load(xa + ((p * 64 + lane) * 8 + e)) for e in range(8)],
+                fx.Int32,
             )
             w8 = fx.Vector.from_elements(
                 [wv[2 * p + i][e] for i in range(2) for e in range(4)], fx.Int32
@@ -425,7 +446,9 @@ def build_front(key: FrontBuild):
         stamp(a, 2)
         if tid == 0:
             sync_release("agent")
-            old = fx.llvm.atomic_add(_ptr(scratch, CNT + h * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent")
+            old = fx.llvm.atomic_add(
+                _ptr(scratch, CNT + h * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent"
+            )
             fx.ptr_store(old, lastp)
         gpu.barrier()
         stamp(a, 3)

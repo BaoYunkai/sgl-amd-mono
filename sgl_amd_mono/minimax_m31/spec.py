@@ -123,7 +123,9 @@ SGLANG_READS = {
         "seq_lens",
         "req_pool_indices",
     ),
-    "srt/layers/attention/minimax_sparse_ops/minimax_sparse.py": ("minimax_sparse_decode",),
+    "srt/layers/attention/minimax_sparse_ops/minimax_sparse.py": (
+        "minimax_sparse_decode",
+    ),
     "srt/layers/radix_attention.py": (
         "q_scale_float",
         "k_scale_float",
@@ -376,7 +378,9 @@ def front_disable_reasons(layer) -> list[str]:
         attn.attn.idx_k_scale_float,
     )
     if any(v not in (None, 1.0) for v in scales):
-        return [f"Q / K / V / index Q / index K scales {scales}: the launches take unit ones"]
+        return [
+            f"Q / K / V / index Q / index K scales {scales}: the launches take unit ones"
+        ]
     return []
 
 
@@ -484,7 +488,8 @@ class _Built:
             meta is None
             or not getattr(sparse, "kv_is_nvfp4", False)
             or sparse.speculative_num_draft_tokens != 8
-            or rows % 8 or not 1 <= rows // 8 <= 2
+            or rows % 8
+            or not 1 <= rows // 8 <= 2
             or meta.seq_lens.shape[0] != rows
             or sparse.use_dense_sparse_decode
             or sparse._use_msa_decode
@@ -493,7 +498,8 @@ class _Built:
             or sparse.fp8_attn_gemm
             or sparse.index_cache_enabled
             or sparse.score_type != "max"
-            or (sparse.block_size_k, sparse.page_size, sparse.topk_blocks) != (128, 128, 16)
+            or (sparse.block_size_k, sparse.page_size, sparse.topk_blocks)
+            != (128, 128, 16)
             or (sparse.init_blocks, sparse.local_blocks) != (0, 1)
         ):
             return None
@@ -511,7 +517,9 @@ class _Built:
         meta = sparse._linear_verify_meta
         rows = q.shape[0]
         k, v, ik = caches
-        topk = self.index(iq, ik, sparse.req_to_token, meta.seq_lens, meta.req_pool_indices)
+        topk = self.index(
+            iq, ik, sparse.req_to_token, meta.seq_lens, meta.req_pool_indices
+        )
         if self.attend is not None:
             return self.attend(
                 q, k, v, sparse.req_to_token, meta.seq_lens, meta.req_pool_indices, topk
@@ -595,7 +603,9 @@ class _Built:
                 and self._front_pool(layer, lid) is not None
             )
             if front:
-                attn, entering = self._front(layer, lid, *held, positions, forward_batch, aux)
+                attn, entering = self._front(
+                    layer, lid, *held, positions, forward_batch, aux
+                )
             else:
                 if held is not None:
                     stream.write(held[1])
@@ -614,7 +624,9 @@ class _Built:
                 )
                 with _o_proj_input(layer.self_attn.o_proj):
                     attn = layer.self_attn(
-                        positions=positions, hidden_states=x, forward_batch=forward_batch
+                        positions=positions,
+                        hidden_states=x,
+                        forward_batch=forward_batch,
                     )
                 entering = stream.residual
             out, residual = self.runner(
@@ -714,9 +726,7 @@ def build(model, hf_config, ctx):
     if os.environ.get("SGLANG_AMD_MONO_M31_FRONT", "1") == "1":
         from sgl_amd_mono.minimax_m31.runner import FrontRunner
 
-        reasons = {
-            i: front_disable_reasons(model.model.layers[i]) for i in sparse[1:]
-        }
+        reasons = {i: front_disable_reasons(model.model.layers[i]) for i in sparse[1:]}
         off = {i: r for i, r in reasons.items() if r}
         if off:
             logger.info("M3.1 attention front off: %s", next(iter(off.items())))
@@ -725,7 +735,9 @@ def build(model, hf_config, ctx):
                 FrontRunner(device, tuple(ctx.widths)),
                 {i: _front_weights(model.model.layers[i]) for i in sparse[1:]},
             )
-            logger.info("M3.1 attention front launch: layers %d .. %d", sparse[1], sparse[-1])
+            logger.info(
+                "M3.1 attention front launch: layers %d .. %d", sparse[1], sparse[-1]
+            )
     index = None
     if front is not None and os.environ.get("SGLANG_AMD_MONO_M31_INDEX", "1") == "1":
         from sgl_amd_mono.minimax_m31.runner import IndexRunner

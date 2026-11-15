@@ -17,16 +17,32 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu
-from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, T, as_ir_value
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int32, Int64, T
 
-from sgl_amd_mono.common.ops import bf16_pair, clock, hw_exp2, hw_rcp, ld_i32, rsrc, sload64, xshfl
-
+from sgl_amd_mono.common.ops import (
+    bf16_pair,
+    clock,
+    hw_exp2,
+    hw_rcp,
+    ld_i32,
+    rsrc,
+    sload64,
+    xshfl,
+)
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
 from .index import e4m3_f16x2, fp4x2_f16, note_bad
-from .sync import _ptr, cta_sync, load_dev, store32, store128, store_dev, sync_acquire, sync_release
+from .sync import (
+    _ptr,
+    cta_sync,
+    load_dev,
+    store32,
+    store128,
+    store_dev,
+    sync_acquire,
+    sync_release,
+)
 
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
@@ -76,7 +92,9 @@ def kernel_name(key: SparseBuild) -> str:
 def stamp(a, k):
     if const_expr(a["timeline"]):  # noqa: SIM102
         if fx.thread_idx.x == 0:
-            bo.buffer_store(clock(), rsrc(a["scratch"]), TL // 2 + fx.block_idx.x * TL_POINTS + k)
+            bo.buffer_store(
+                clock(), rsrc(a["scratch"]), TL // 2 + fx.block_idx.x * TL_POINTS + k
+            )
 
 
 def bf16x8_f16(w4):
@@ -85,7 +103,11 @@ def bf16x8_f16(w4):
     for d in range_constexpr(4):
         w = fx.Int32(w4[d])
         lo, hi = (w << 16).bitcast(fx.Float32), (w & -65536).bitcast(fx.Float32)
-        out.append(fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.Float16).bitcast(fx.Int32)[0])
+        out.append(
+            fx.Vector.from_elements([lo, hi], fx.Float32)
+            .to(fx.Float16)
+            .bitcast(fx.Int32)[0]
+        )
     return fx.Vector.from_elements(out, fx.Int32)
 
 
@@ -98,7 +120,11 @@ def mfma16(a, b, c):
 
 
 def f16x2(lo, hi):
-    return fx.Vector.from_elements([lo, hi], fx.Float32).to(fx.Float16).bitcast(fx.Int32)[0]
+    return (
+        fx.Vector.from_elements([lo, hi], fx.Float32)
+        .to(fx.Float16)
+        .bitcast(fx.Int32)[0]
+    )
 
 
 @flyc.jit
@@ -108,7 +134,10 @@ def merge_row(a, row, tid):
     h, d0 = tid // 16, 8 * (tid % 16)
     base = PART + row * TOPK * STATE
     mls = [load_dev(a["scratch"], base + j * STATE + 2 * h, 2) for j in range(TOPK)]
-    os_ = [load_dev(a["scratch"], base + j * STATE + 2 * HEADS + (h * HEAD + d0) // 2, 4) for j in range(TOPK)]
+    os_ = [
+        load_dev(a["scratch"], base + j * STATE + 2 * HEADS + (h * HEAD + d0) // 2, 4)
+        for j in range(TOPK)
+    ]
     ms = [fx.Int32(mls[j][0]).bitcast(fx.Float32) for j in range(TOPK)]
     ls = [fx.Int32(mls[j][1]).bitcast(fx.Float32) for j in range(TOPK)]
     mx = ms[0]
@@ -125,7 +154,10 @@ def merge_row(a, row, tid):
             o[2 * q] = o[2 * q] + (w << 16).bitcast(fx.Float32) * f
             o[2 * q + 1] = o[2 * q + 1] + (w & -65536).bitcast(fx.Float32) * f
     inv = (lsum > 0.0).select(hw_rcp(lsum), fx.Float32(0.0))
-    words = [bf16_pair(o[2 * k] * inv, o[2 * k + 1] * inv).bitcast(fx.Int32) for k in range(4)]
+    words = [
+        bf16_pair(o[2 * k] * inv, o[2 * k + 1] * inv).bitcast(fx.Int32)
+        for k in range(4)
+    ]
     bo.buffer_store(
         fx.Vector.from_elements(words, fx.Int32),
         rsrc(a["out"]),
@@ -175,7 +207,12 @@ def build_sparse(key: SparseBuild):
         # contiguous dims, as its K payload bytes are)
         qw = [
             fx.Vector(
-                bo.buffer_load(rsrc(q), (row * HEADS + n16) * (HEAD // 2) + 16 * g + 4 * kk, vec_width=4, dtype=T.i32)
+                bo.buffer_load(
+                    rsrc(q),
+                    (row * HEADS + n16) * (HEAD // 2) + 16 * g + 4 * kk,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
             )
             for kk in range(4)
         ]
@@ -190,13 +227,17 @@ def build_sparse(key: SparseBuild):
         seq_len = fx.min(seq_len, r2t_len)
         bad_blk = blk * BLOCK >= seq_len
         if (tid == 0) & (bad_req | bad_len | bad_blk):
-            bits = bad_req.select(fx.Int32(1), fx.Int32(0)) | bad_len.select(fx.Int32(2), fx.Int32(0))
+            bits = bad_req.select(fx.Int32(1), fx.Int32(0)) | bad_len.select(
+                fx.Int32(2), fx.Int32(0)
+            )
             bits = bits | bad_blk.select(fx.Int32(4), fx.Int32(0))
             note_bad(scratch, DBG, bits, fx.max(blk, seq_len))
         req = bad_req.select(fx.Int32(0), req)
         valid = (blk >= 0) & (~bad_blk)
         bsafe = valid.select(blk, fx.Int32(0))
-        s0 = fx.Int32(rocdl.readfirstlane(T.i32, ld_i32(r2t, req * r2t_stride + bsafe * BLOCK)))
+        s0 = fx.Int32(
+            rocdl.readfirstlane(T.i32, ld_i32(r2t, req * r2t_stride + bsafe * BLOCK))
+        )
         page = ((s0 // BLOCK) % max_pages + max_pages) % max_pages
         nvalid = valid.select(seq_len - bsafe * BLOCK, fx.Int32(0))
         t0 = wave * TOK_W
@@ -204,19 +245,37 @@ def build_sparse(key: SparseBuild):
         # K: S^T's A, token t0 + 16 u + n16 at dims 32 g .. (16 payload bytes)
         kw = [
             fx.Vector(
-                bo.buffer_load(rk, (page * key.pay_page + (t0 + 16 * u + n16) * key.pay_row + 16 * g) // 4, vec_width=4, dtype=T.i32)
+                bo.buffer_load(
+                    rk,
+                    (page * key.pay_page + (t0 + 16 * u + n16) * key.pay_row + 16 * g)
+                    // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
             )
             for u in range(2)
         ]
         ks = [
-            ld_i32(ksc, (page * key.sc_page + (t0 + 16 * u + n16) * key.sc_row + 4 * (g // 2)) // 4)
+            ld_i32(
+                ksc,
+                (page * key.sc_page + (t0 + 16 * u + n16) * key.sc_row + 4 * (g // 2))
+                // 4,
+            )
             for u in range(2)
         ]
         # V: O^T's A, dims 8 n16 .. (payload dword n16) of the tokens of PV K index
         # 8 g + jj: t0 + 4 g + jj, then t0 + 16 + 4 g + jj - 4
-        vtok = [t0 + 4 * g + jj if jj < 4 else t0 + 16 + 4 * g + jj - 4 for jj in range(8)]
-        vw = [ld_i32(vp, (page * key.pay_page + tk * key.pay_row) // 4 + n16) for tk in vtok]
-        vs = [ld_i32(vsc, (page * key.sc_page + tk * key.sc_row) // 4 + n16 // 8) for tk in vtok]
+        vtok = [
+            t0 + 4 * g + jj if jj < 4 else t0 + 16 + 4 * g + jj - 4 for jj in range(8)
+        ]
+        vw = [
+            ld_i32(vp, (page * key.pay_page + tk * key.pay_row) // 4 + n16)
+            for tk in vtok
+        ]
+        vs = [
+            ld_i32(vsc, (page * key.sc_page + tk * key.sc_row) // 4 + n16 // 8)
+            for tk in vtok
+        ]
         stamp(a, 1)
         qb = [bf16x8_f16(qw[kk]) for kk in range(4)]
         sacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
@@ -226,7 +285,9 @@ def build_sparse(key: SparseBuild):
             for kk in range_constexpr(4):
                 word = fx.Int32(kw[u][kk])
                 scl = sc0 if kk < 2 else sc1
-                ka = fx.Vector.from_elements([fp4x2_f16(word, scl, jb) for jb in range(4)], fx.Int32)
+                ka = fx.Vector.from_elements(
+                    [fp4x2_f16(word, scl, jb) for jb in range(4)], fx.Int32
+                )
                 sacc[u] = mfma16(ka, qb[kk], sacc[u])
         # S^T element i of tile u: token t0 + 16 u + 4 g + i, head n16
         qk = fx.Float32(SM_SCALE * LOG2E)
@@ -247,7 +308,9 @@ def build_sparse(key: SparseBuild):
         for off in (16, 32):
             lsum = lsum + xshfl(lsum, off)
         # P^T: K index 8 g + jj is S^T tile jj // 4, element jj % 4
-        pb = fx.Vector.from_elements([f16x2(ps[2 * k], ps[2 * k + 1]) for k in range(4)], fx.Int32)
+        pb = fx.Vector.from_elements(
+            [f16x2(ps[2 * k], ps[2 * k + 1]) for k in range(4)], fx.Int32
+        )
         oacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(8)]
         vscl = []
         for jj in range_constexpr(8):
@@ -259,7 +322,9 @@ def build_sparse(key: SparseBuild):
             for k in range_constexpr(4):
                 w0, w1 = vw[2 * k], vw[2 * k + 1]
                 nib = ((w0 >> (4 * e)) & 0xF) | (((w1 >> (4 * e)) & 0xF) << 4)
-                sc = fx.Vector.from_elements([vscl[2 * k][0], vscl[2 * k + 1][0]], fx.Float16)
+                sc = fx.Vector.from_elements(
+                    [vscl[2 * k][0], vscl[2 * k + 1][0]], fx.Float16
+                )
                 pairs.append(fp4x2_f16(nib, sc, 0))
             va = fx.Vector.from_elements(pairs, fx.Int32)
             oacc[e] = mfma16(va, pb, oacc[e])
@@ -277,11 +342,16 @@ def build_sparse(key: SparseBuild):
         # the block's state: the waves' merged, a thread 8 dims of a head
         h, d0 = tid // 16, 8 * (tid % 16)
         mw = [fx.ptr_load(lds.ml.ptr + (w * 2 * HEADS + h)) for w in range(WAVES)]
-        lw = [fx.ptr_load(lds.ml.ptr + (w * 2 * HEADS + HEADS + h)) for w in range(WAVES)]
+        lw = [
+            fx.ptr_load(lds.ml.ptr + (w * 2 * HEADS + HEADS + h)) for w in range(WAVES)
+        ]
         mb = mw[0]
         for w in range_constexpr(1, WAVES):
             mb = fx.max(mb, mw[w])
-        fw = [(lw[w] > 0.0).select(hw_exp2(mw[w] - mb), fx.Float32(0.0)) for w in range(WAVES)]
+        fw = [
+            (lw[w] > 0.0).select(hw_exp2(mw[w] - mb), fx.Float32(0.0))
+            for w in range(WAVES)
+        ]
         lb = fx.Float32(0.0)
         for w in range_constexpr(WAVES):
             lb = lb + lw[w] * fw[w]
@@ -291,17 +361,34 @@ def build_sparse(key: SparseBuild):
         for dd in range_constexpr(8):
             v = fx.Float32(0.0)
             for w in range_constexpr(WAVES):
-                v = v + fx.ptr_load(lds.acc.ptr + ((w * HEADS + h) * HEAD + d0 + dd)) * fw[w]
+                v = (
+                    v
+                    + fx.ptr_load(lds.acc.ptr + ((w * HEADS + h) * HEAD + d0 + dd))
+                    * fw[w]
+                )
             vals.append(v * inv)
-        words = [bf16_pair(vals[2 * k], vals[2 * k + 1]).bitcast(fx.Int32) for k in range(4)]
-        store128(scratch, base + 2 * HEADS + (h * HEAD + d0) // 2, fx.Vector.from_elements(words, fx.Int32), "agent")
+        words = [
+            bf16_pair(vals[2 * k], vals[2 * k + 1]).bitcast(fx.Int32) for k in range(4)
+        ]
+        store128(
+            scratch,
+            base + 2 * HEADS + (h * HEAD + d0) // 2,
+            fx.Vector.from_elements(words, fx.Int32),
+            "agent",
+        )
         if tid % 16 == 0:
-            store_dev(scratch, base + 2 * h, [mb.bitcast(fx.Int32), lb.bitcast(fx.Int32)])
+            store_dev(
+                scratch, base + 2 * h, [mb.bitcast(fx.Int32), lb.bitcast(fx.Int32)]
+            )
         cta_sync(drain=True)
         stamp(a, 3)
         if tid == 0:
             sync_release("agent")
-            old = fx.llvm.atomic_add(_ptr(scratch, CNT + row * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent")
+            old = fx.llvm.atomic_add(
+                _ptr(scratch, CNT + row * CNT_STRIDE, 32),
+                fx.Int32(1),
+                syncscope="agent",
+            )
             fx.ptr_store(old, lds.last.ptr)
         gpu.barrier()
         stamp(a, 4)
@@ -333,8 +420,22 @@ def build_sparse(key: SparseBuild):
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
-        ksparse(q, kp, ksc, vp, vsc, r2t, seq, slot, topk, out, scratch, r2t_stride, max_pages, r2t_rows, r2t_len).launch(
-            grid=(s * TOPK,), block=(THREADS,), stream=stream
-        )
+        ksparse(
+            q,
+            kp,
+            ksc,
+            vp,
+            vsc,
+            r2t,
+            seq,
+            slot,
+            topk,
+            out,
+            scratch,
+            r2t_stride,
+            max_pages,
+            r2t_rows,
+            r2t_len,
+        ).launch(grid=(s * TOPK,), block=(THREADS,), stream=stream)
 
     return launch
