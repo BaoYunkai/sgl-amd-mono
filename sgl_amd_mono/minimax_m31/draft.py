@@ -208,7 +208,10 @@ def _kv_project(runner):
 def _build(model, hf_config, ctx) -> _Draft:
     from sglang.srt.runtime_context import get_parallel
 
+    from sgl_amd_mono.minimax_m31 import draft_sampler
+
     original = type(model).forward.__get__(model, type(model))
+    draft_sampler.install(model, ctx.deadline_s)
     if os.environ.get(ENV, "1") == "0":
         logger.info("monokernel: MiniMax-M3.1 DSpark draft attached, %s=0: the model's own forward", ENV)
         return _Draft(model, original)
