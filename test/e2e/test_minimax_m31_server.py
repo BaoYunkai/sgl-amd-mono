@@ -123,6 +123,18 @@ class TestMonokernelVerify(_Serving, CustomTestCase):
         "size [1, 2] x 8 tokens"
     )
 
+    def test_the_draft_runs_its_launches(self):
+        # the DSpark draft's layers and its sampled Markov block; else SGLang's run
+        log = _logs(self.logs)
+        self.assertIn(
+            "monokernel minimax_m31_dspark_draft_hip on gfx950 runs target_verify steps "
+            "of batch size [1, 2] x 7 tokens",
+            log,
+        )
+        self.assertIn(
+            "M3.1 DSpark draft: the sampled Markov block in the gfx950 kernels", log
+        )
+
 
 class TestMonokernelDecode(_Serving, CustomTestCase):
     """Decode steps without DSpark: above 16 rows the normal path."""
