@@ -266,17 +266,54 @@ class FrontRunner:
         return res_new, q, iq
 
 
+def watch_bad_inputs(name: str, scratch: torch.Tensor, at: int) -> None:
+    """``SGLANG_AMD_MONO_M31_K2_DEBUG=1``: once the server serves, log a launch's
+    out-of-range inputs (the kernel's DBG words: an OR of 1 slot, 2 length, 4 block,
+    and the largest value) every 5 s, then clear them."""
+    if os.environ.get("SGLANG_AMD_MONO_M31_K2_DEBUG", "0") != "1":
+        return
+    import logging
+    import threading
+    import time
+    import urllib.request
+
+    log = logging.getLogger(__name__)
+    side = torch.cuda.Stream(device=scratch.device)
+
+    def run():
+        while True:
+            time.sleep(5)
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:31000/v1/models", timeout=5) as r:
+                    if r.status == 200:
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        words = scratch.view(torch.int32)[at : at + 2]
+        while True:
+            time.sleep(5)
+            with torch.cuda.stream(side):
+                bits, value = words.cpu().tolist()
+                if bits:
+                    words.zero_()
+            if bits:
+                log.warning("%s saw out-of-range inputs: bits %d, largest %d", name, bits, value)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 class IndexRunner:
     """Host side of the verify indexer (``index.py``): a compiled kernel per row
     count and index-K pool layout, one scratch region (the rows' block scores and a
     counter a request, which the request's last CTA resets)."""
 
     def __init__(self, device: torch.device) -> None:
-        from .index import SCRATCH_BYTES
+        from .index import DBG, SCRATCH_BYTES
 
         _writable_flydsl_cache()
         self.scratch = torch.zeros(SCRATCH_BYTES, dtype=torch.uint8, device=device)
         self._compiled: dict[Any, Any] = {}
+        watch_bad_inputs("verify indexer", self.scratch, DBG)
 
     def __call__(self, iq, cache, req_to_token, seq_lens, slot_ids):
         """``iq``: the rows' index Q ([rows, 128] bf16, rows = requests x 8 drafts);
@@ -310,6 +347,8 @@ class IndexRunner:
             self.scratch.data_ptr(),
             req_to_token.stride(0),
             cache.payload.shape[0],
+            req_to_token.shape[0],
+            req_to_token.shape[1],
             torch.cuda.current_stream(),
         )
         if key not in self._compiled:
@@ -324,11 +363,12 @@ class SparseRunner:
     states and a counter a row, which the row's last CTA resets)."""
 
     def __init__(self, device: torch.device) -> None:
-        from .sparse import SCRATCH_BYTES
+        from .sparse import DBG, SCRATCH_BYTES
 
         _writable_flydsl_cache()
         self.scratch = torch.zeros(SCRATCH_BYTES, dtype=torch.uint8, device=device)
         self._compiled: dict[Any, Any] = {}
+        watch_bad_inputs("verify sparse attention", self.scratch, DBG)
 
     def __call__(self, q, k, v, req_to_token, seq_lens, slot_ids, topk):
         """``q``: the rows' Q ([rows, 16 x 128] bf16); ``k`` / ``v``: the layer's main
@@ -366,6 +406,8 @@ class SparseRunner:
             self.scratch.data_ptr(),
             req_to_token.stride(0),
             k.payload.shape[0],
+            req_to_token.shape[0],
+            req_to_token.shape[1],
             torch.cuda.current_stream(),
         )
         if key not in self._compiled:
