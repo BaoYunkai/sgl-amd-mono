@@ -30,7 +30,10 @@ SGLANG_READS = {
         "compute_base_logits",
         "markov_head",
     ),
-    "srt/layers/vocab_parallel_embedding.py": ("num_embeddings_per_partition", "use_attn_tp_group"),
+    "srt/layers/vocab_parallel_embedding.py": (
+        "num_embeddings_per_partition",
+        "use_attn_tp_group",
+    ),
     "srt/speculative/dspark_components/dspark_draft.py": (
         "draft_markov_block",
         "draft_markov_block(markov_head)",
@@ -75,14 +78,20 @@ def install(model, deadline_s: float) -> None:
     """Offer the kernels' Markov block to the DSpark draft ``model``'s sampler."""
     if os.environ.get(ENV, "1") == "0" or "_megakernel" in model.__dict__:
         return
-    model.__dict__["_megakernel"] = _Entries(functools.partial(_factory, model, deadline_s))
+    model.__dict__["_megakernel"] = _Entries(
+        functools.partial(_factory, model, deadline_s)
+    )
 
 
 def _group(model):
     from sglang.srt.runtime_context import get_parallel
 
     p = get_parallel()
-    return p.attn_tp_group if getattr(model.lm_head, "use_attn_tp_group", False) else p.tp_group
+    return (
+        p.attn_tp_group
+        if getattr(model.lm_head, "use_attn_tp_group", False)
+        else p.tp_group
+    )
 
 
 def _why_not(model, step_logits) -> str | None:
@@ -114,7 +123,9 @@ def _why_not(model, step_logits) -> str | None:
 
 
 class _Sampler:
-    def __init__(self, model, deadline_s, gamma, noise, draft_tokens, step_logits, temps):
+    def __init__(
+        self, model, deadline_s, gamma, noise, draft_tokens, step_logits, temps
+    ):
         from sgl_amd_mono.minimax_m31 import markov
 
         head = model.markov_head
@@ -128,8 +139,16 @@ class _Sampler:
         assert self.head.is_contiguous()
         device = self.head.device
         part = int(model.lm_head.num_embeddings_per_partition)
-        self.part = torch.empty(markov.MAX_SEQUENCES, markov.blocks(part), 2, dtype=torch.float32, device=device)
-        self.exchange = markov.Exchange(group.cpu_group, group.rank_in_group, group.world_size, device)
+        self.part = torch.empty(
+            markov.MAX_SEQUENCES,
+            markov.blocks(part),
+            2,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.exchange = markov.Exchange(
+            group.cpu_group, group.rank_in_group, group.world_size, device
+        )
         self.ops = markov.ops()
 
     def block(self, base_logits, anchor, temps, noise, out, step_logits):
@@ -150,7 +169,14 @@ class _Sampler:
         bs = anchor_tokens.shape[0]
         base = base_logits.view(bs, self.gamma, -1)
         out = self.out[: bs * self.gamma]
-        self.block(base, anchor_tokens.long(), self.temps[:bs], self.noise, out, self.step_logits[:bs])
+        self.block(
+            base,
+            anchor_tokens.long(),
+            self.temps[:bs],
+            self.noise,
+            out,
+            self.step_logits[:bs],
+        )
         return out.view(bs, self.gamma), confidence_features
 
     def disagrees(self, max_bs: int) -> str | None:
@@ -169,11 +195,17 @@ class _Sampler:
         width = int(self.model.lm_head.num_embeddings_per_partition)
         g = torch.Generator(device=device).manual_seed(1234)
         for bs in range(1, max_bs + 1):
-            base = (torch.randn(bs, gamma, width, generator=g, device=device) * 3).bfloat16()
-            anchor = torch.randint(0, head.vocab_size, (bs,), generator=g, device=device).long()
+            base = (
+                torch.randn(bs, gamma, width, generator=g, device=device) * 3
+            ).bfloat16()
+            anchor = torch.randint(
+                0, head.vocab_size, (bs,), generator=g, device=device
+            ).long()
             temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=device)
             offset = torch.randint(0, 1 << 30, (1,), generator=g, device=device)
-            want_logits = torch.empty(bs, gamma, width, dtype=torch.bfloat16, device=device)
+            want_logits = torch.empty(
+                bs, gamma, width, dtype=torch.bfloat16, device=device
+            )
             want, _ = draft_markov_block(
                 markov_head=head, base_logits=base, anchor_tokens=anchor,
                 draft_hidden=None, step_temperatures=temps,
@@ -191,7 +223,9 @@ class _Sampler:
             w, gl = want_logits.float(), got_logits.float()
             bias = (w - base.float()).abs()
             if not ((gl - w).abs() <= (w.abs() + bias) * 2**-7 + 1e-6).all():
-                return f"{bs} rows: step logits apart by {(gl - w).abs().max().item():.3g}"
+                return (
+                    f"{bs} rows: step logits apart by {(gl - w).abs().max().item():.3g}"
+                )
             if int(noise.offset.item()) != int(offset.item()) + 1:
                 return "the noise counter did not advance once"
         return None
@@ -223,7 +257,15 @@ def _factory(model, deadline_s, *, gamma, max_bs, greedy_draft, noise, draft_tok
         return keep(why or "another rank's Markov head")
     sampler = None
     try:
-        sampler = _Sampler(model, deadline_s, gamma, noise, draft_tokens, step_logits, step_temperatures)
+        sampler = _Sampler(
+            model,
+            deadline_s,
+            gamma,
+            noise,
+            draft_tokens,
+            step_logits,
+            step_temperatures,
+        )
     except Exception as e:  # noqa: BLE001 (every rank must still reach the agreement)
         why = f"the kernels do not build: {type(e).__name__}: {e}"
     if not agree(sampler is not None):
@@ -234,5 +276,8 @@ def _factory(model, deadline_s, *, gamma, max_bs, greedy_draft, noise, draft_tok
         sampler.exchange.close()
         return keep(why or "the kernels disagree with SGLang on another rank")
     if group.rank_in_group == 0:
-        _LOGGER.info("M3.1 DSpark draft: the sampled Markov block in the gfx950 kernels at batch sizes 1 to %d", top)
+        _LOGGER.info(
+            "M3.1 DSpark draft: the sampled Markov block in the gfx950 kernels at batch sizes 1 to %d",
+            top,
+        )
     return lambda bs: sampler.step if 1 <= bs <= top else None

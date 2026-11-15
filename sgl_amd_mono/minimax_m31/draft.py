@@ -138,17 +138,23 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     if get_parallel().tp_size != TP:
         reasons.append(f"draft TP {get_parallel().tp_size}: the launch takes TP {TP}")
     if int(getattr(model, "block_size", 0)) != layout.QPR:
-        reasons.append(f"draft block {getattr(model, 'block_size', None)}: the launch takes {layout.QPR}")
+        reasons.append(
+            f"draft block {getattr(model, 'block_size', None)}: the launch takes {layout.QPR}"
+        )
     layers = getattr(model, "layers", [])
     if len(layers) != layout.LAYERS:
         reasons.append(f"{len(layers)} draft layers: the launch takes {layout.LAYERS}")
     page = int(get_schedule().page_size or 0)
     if page != layout.BLOCK:
-        reasons.append(f"page size {page}: a partition block is one {layout.BLOCK}-slot page")
+        reasons.append(
+            f"page size {page}: a partition block is one {layout.BLOCK}-slot page"
+        )
     config = getattr(model, "config", hf_config)
     window = get_dflash_attention_sliding_window_size(config)
     if window != layout.WINDOW - 1:
-        reasons.append(f"draft window left {window}: the launch takes {layout.WINDOW - 1}")
+        reasons.append(
+            f"draft window left {window}: the launch takes {layout.WINDOW - 1}"
+        )
     if not _cfg(config, "use_gemma_norm"):
         reasons.append("the draft's norms are not Gemma RMSNorms")
     if (_cfg(config, "swiglu_limit"), _cfg(config, "swiglu_alpha")) != (7.0, 1.702):
@@ -156,8 +162,13 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     for i, L in enumerate(layers):
         a = L.self_attn
         if (a.num_heads, a.num_kv_heads, a.head_dim) != (layout.HEADS, 1, layout.HD):
-            reasons.append(f"draft layer {i}: heads {a.num_heads} / {a.num_kv_heads} of {a.head_dim} a rank")
-        if not getattr(a.rotary_emb, "is_neox_style", False) or a.rotary_emb.cos_sin_cache.shape[-1] != layout.ROT:
+            reasons.append(
+                f"draft layer {i}: heads {a.num_heads} / {a.num_kv_heads} of {a.head_dim} a rank"
+            )
+        if (
+            not getattr(a.rotary_emb, "is_neox_style", False)
+            or a.rotary_emb.cos_sin_cache.shape[-1] != layout.ROT
+        ):
             reasons.append(f"draft layer {i}: needs NeoX RoPE over {layout.ROT} dims")
     missing = [
         (i, p, kind)
@@ -167,8 +178,15 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         if ("m31 draft", i, p, kind) not in copies
     ]
     if missing:
-        reasons.append(f"the draft's MXFP8 checkpoint shards were not all seen at load ({missing[0]} ..)")
-    if torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count != layout.BLOCKS:
+        reasons.append(
+            f"the draft's MXFP8 checkpoint shards were not all seen at load ({missing[0]} ..)"
+        )
+    if (
+        torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        != layout.BLOCKS
+    ):
         reasons.append(f"the launch needs {layout.BLOCKS} CUs")
     return reasons
 
@@ -180,15 +198,32 @@ class _Draft:
     def __init__(self, model, original, runner=None):
         self.model, self.original, self.runner = model, original, runner
 
-    def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None, *args, **kwargs):
+    def forward(
+        self,
+        plan,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        *args,
+        **kwargs,
+    ):
         """``DSparkMiniMaxDraftModel.forward`` for a routed draft step."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         if self.runner is None:
-            return self.original(input_ids, positions, forward_batch, input_embeds, *args, **kwargs)
-        x = self.model.forward_embed(input_ids) if input_embeds is None else input_embeds
-        h = self.runner.forward(x.contiguous(), positions, forward_batch, get_attn_backend())
+            return self.original(
+                input_ids, positions, forward_batch, input_embeds, *args, **kwargs
+            )
+        x = (
+            self.model.forward_embed(input_ids)
+            if input_embeds is None
+            else input_embeds
+        )
+        h = self.runner.forward(
+            x.contiguous(), positions, forward_batch, get_attn_backend()
+        )
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=h)
 
 
@@ -213,21 +248,33 @@ def _build(model, hf_config, ctx) -> _Draft:
     original = type(model).forward.__get__(model, type(model))
     draft_sampler.install(model, ctx.deadline_s)
     if os.environ.get(ENV, "1") == "0":
-        logger.info("monokernel: MiniMax-M3.1 DSpark draft attached, %s=0: the model's own forward", ENV)
+        logger.info(
+            "monokernel: MiniMax-M3.1 DSpark draft attached, %s=0: the model's own forward",
+            ENV,
+        )
         return _Draft(model, original)
     p = get_parallel()
     weights = _layer_weights(ctx.copies)
     runner = R.DraftRunner(
-        model, weights, p.tp_rank, p.tp_group.cpu_group, model.norm.weight.device, ctx.deadline_s
+        model,
+        weights,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        model.norm.weight.device,
+        ctx.deadline_s,
     )
     for key in [k for k in ctx.copies if k[0] == "m31 draft"]:
         del ctx.copies[key]
     if os.environ.get(KV_ENV, "1") == "1":
         # SGLang's fused write takes any projection; the MiniMax draft offers none on ROCm
         project = _kv_project(runner)
-        model._build_fused_kv_write_bundle = lambda pool: model._fused_kv_write_layout(pool, project=project)
+        model._build_fused_kv_write_bundle = lambda pool: model._fused_kv_write_layout(
+            pool, project=project
+        )
         model._fused_kv_write_cache = None
-    logger.info("monokernel: MiniMax-M3.1 DSpark draft attached (5 layers and the final norm a launch)")
+    logger.info(
+        "monokernel: MiniMax-M3.1 DSpark draft attached (5 layers and the final norm a launch)"
+    )
     return _Draft(model, original, runner)
 
 

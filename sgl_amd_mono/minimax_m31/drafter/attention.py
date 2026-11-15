@@ -28,8 +28,9 @@ exponent): l and o carry the factor 256, which o / l cancels.
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -94,7 +95,9 @@ def kv_load(cache, r2t, r, blk, lo, hi, tid):
     table, width, row = r2t
     # padded requests of a graph replay carry stale metadata: keep every address
     # inside the table row and the caches
-    col = fx.min(fx.max(fx.min(blk, hi // layout.BLOCK), I32(0)), width // layout.BLOCK - 1)
+    col = fx.min(
+        fx.max(fx.min(blk, hi // layout.BLOCK), I32(0)), width // layout.BLOCK - 1
+    )
     s0 = dev.ld(table + I64(row) * I64(width) * 4, col * layout.BLOCK)
     s0 = fx.min(fx.max(s0, I32(0)), nslots - layout.BLOCK)
     kb = kc + I64(s0) * layout.KV_ROW
@@ -118,8 +121,12 @@ def kv_load(cache, r2t, r, blk, lo, hi, tid):
         vp = blk * layout.BLOCK + m
         vlive = (vp >= lo) & (vp <= hi)
         v = dev.ld(vb, m * 64 + vd * 4, 4)
-        w0 = fp8_pack4(dev.bf_lo(v[0]), dev.bf_hi(v[0]), dev.bf_lo(v[1]), dev.bf_hi(v[1]))
-        w1 = fp8_pack4(dev.bf_lo(v[2]), dev.bf_hi(v[2]), dev.bf_lo(v[3]), dev.bf_hi(v[3]))
+        w0 = fp8_pack4(
+            dev.bf_lo(v[0]), dev.bf_hi(v[0]), dev.bf_lo(v[1]), dev.bf_hi(v[1])
+        )
+        w1 = fp8_pack4(
+            dev.bf_lo(v[2]), dev.bf_hi(v[2]), dev.bf_lo(v[3]), dev.bf_hi(v[3])
+        )
         vw.append([vlive.select(w0, I32(0)), vlive.select(w1, I32(0))])
     return kw, vw
 

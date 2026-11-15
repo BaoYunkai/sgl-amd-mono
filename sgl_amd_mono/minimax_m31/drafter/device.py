@@ -20,8 +20,9 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -29,12 +30,14 @@ from sgl_amd_mono.common.ops import (
     CM_SYS,
     bf16_pair,
     butterfly,
+)
+from sgl_amd_mono.common.ops import clock as memrealtime
+from sgl_amd_mono.common.ops import (
     fp8_pack4,
     hw_exp2,
     rsrc,
     xshfl,
 )
-from sgl_amd_mono.common.ops import clock as memrealtime
 from sgl_amd_mono.minimax_m31.drafter import layout
 
 traced = flyc.jit
