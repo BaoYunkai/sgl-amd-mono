@@ -264,3 +264,55 @@ class FrontRunner:
                 self._compiled[width] = flyc.compile(launch, *args)
         self._compiled[s](*args)
         return res_new, q, iq
+
+
+class IndexRunner:
+    """Host side of the verify indexer (``index.py``): a compiled kernel per row
+    count and index-K pool layout, one scratch region (the rows' block scores and a
+    counter a request, which the request's last CTA resets)."""
+
+    def __init__(self, device: torch.device) -> None:
+        from .index import SCRATCH_BYTES
+
+        _writable_flydsl_cache()
+        self.scratch = torch.zeros(SCRATCH_BYTES, dtype=torch.uint8, device=device)
+        self._compiled: dict[Any, Any] = {}
+
+    def __call__(self, iq, cache, req_to_token, seq_lens, slot_ids):
+        """``iq``: the rows' index Q ([rows, 128] bf16, rows = requests x 8 drafts);
+        ``cache``: the layer's index-K ``Nvfp4Cache``; ``seq_lens`` / ``slot_ids``: the
+        verify rows' KV lengths and request slots. Returns SGLang's top-k block ids
+        ([1, rows, 16] int32, ascending, -1 padded)."""
+        import flydsl.compiler as flyc
+
+        from .index import BLOCK, TOPK, IndexBuild, build_index
+
+        rows = iq.shape[0]
+        assert iq.dtype == torch.bfloat16 and iq.is_contiguous()
+        assert cache.payload.dim() == 3 and cache.payload.shape[1] == BLOCK
+        assert slot_ids.dtype == torch.int64 and seq_lens.dtype in (torch.int32, torch.int64)
+        assert req_to_token.dtype == torch.int32 and req_to_token.stride(1) == 1
+        key = IndexBuild(
+            tokens=rows,
+            pay_page=cache.payload.stride(0),
+            sc_page=cache.scales.stride(0),
+            seq_i64=seq_lens.dtype == torch.int64,
+        )
+        out = torch.empty(1, rows, TOPK, dtype=torch.int32, device=iq.device)
+        args = (
+            iq.data_ptr(),
+            cache.payload.data_ptr(),
+            cache.scales.data_ptr(),
+            req_to_token.data_ptr(),
+            seq_lens.data_ptr(),
+            slot_ids.data_ptr(),
+            out.data_ptr(),
+            self.scratch.data_ptr(),
+            req_to_token.stride(0),
+            cache.payload.shape[0],
+            torch.cuda.current_stream(),
+        )
+        if key not in self._compiled:
+            self._compiled[key] = flyc.compile(build_index(key), *args)
+        self._compiled[key](*args)
+        return out
