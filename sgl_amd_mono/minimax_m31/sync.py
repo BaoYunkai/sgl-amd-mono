@@ -121,6 +121,21 @@ def load128(addr, i, scope):
     )
 
 
+def store128(addr, i, vec, scope):
+    """Dwords i .. i + 3 (i a multiple of 4) := ``vec``: one store-available at
+    ``scope``."""
+    ptr = _llvm.IntToPtrOp(
+        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr + fx.Int64(i) * 4)
+    ).result
+    md = _llvm.MetadataAsValueOp(
+        ir.Attribute.parse(f'#llvm.md_node<#llvm.md_string<"{scope}">>'),
+        results=[ir.Type.parse("!llvm.metadata")],
+    ).result
+    _llvm.CallIntrinsicOp(
+        None, "llvm.amdgcn.av.store.b128.p1", [ptr, as_ir_value(vec), md], [], []
+    )
+
+
 def store_dev(addr, i, words):
     """Dwords i .. of this GPU's scratch := ``words`` (1 or 2, i aligned),
     store-available at agent scope."""

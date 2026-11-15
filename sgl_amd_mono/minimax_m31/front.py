@@ -79,7 +79,8 @@ SSQ = PART + BLOCKS * MAX_TOKENS * HEAD
 CNT = SSQ + BLOCKS * MAX_TOKENS
 # timeline stamps (i64): start, X in LDS, partial stored, counter read, head done
 TL_POINTS = 5
-TL = CNT + 64
+CNT_STRIDE = 32  # dwords: a counter a 128-byte line, so arrivals on others do not queue
+TL = CNT + HEADS * CNT_STRIDE
 SCRATCH_BYTES = 4 * (TL + 2 * BLOCKS * TL_POINTS)
 
 
@@ -424,14 +425,14 @@ def build_front(key: FrontBuild):
         stamp(a, 2)
         if tid == 0:
             sync_release("agent")
-            old = fx.llvm.atomic_add(_ptr(scratch, CNT + h, 32), fx.Int32(1), syncscope="agent")
+            old = fx.llvm.atomic_add(_ptr(scratch, CNT + h * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent")
             fx.ptr_store(old, lastp)
         gpu.barrier()
         stamp(a, 3)
         if fx.ptr_load(lastp) == CHUNKS - 1:
             sync_acquire("agent")
             if tid == 0:
-                store32(scratch, CNT + h, 0, "agent")
+                store32(scratch, CNT + h * CNT_STRIDE, 0, "agent")
             finish_head(a, h, wave, lane, ws2, nw, locs, css)
             cta_sync(drain=True)
             stamp(a, 4)
