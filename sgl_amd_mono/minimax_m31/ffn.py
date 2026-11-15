@@ -471,11 +471,12 @@ def stage_reduce(c, task):
     if tid < s * TASK_TRIPLES:
         t = tid // TASK_TRIPLES
         tr = task * TASK_TRIPLES + tid % TASK_TRIPLES
+        # the residual is the launch's input: read it under the ranks' wait
+        res = triple_bits(a["res_in"], t, tr)
         got = c["mb"].poll(
             [(c["own"], attn_pair(c, src, t, tr), 1) for src in range(c["tp"])],
             triples=True,
         )
-        res = triple_bits(a["res_in"], t, tr)
         col = t * HIDDEN + 3 * tr
         for k in range_constexpr(3):
             word = [got[src][0][k // 2] for src in range(c["tp"])]
@@ -685,6 +686,15 @@ def stage_route(c, t):
     quarter = ROUTER_PARTS // 4
     e = tid % EXPERTS
     q = tid // EXPERTS
+    # wave 0's selection bias, the launch's input: read under the logits' wait
+    bias = [fx.Float32(0.0), fx.Float32(0.0)]
+    if wave == 0:
+        bias = [
+            fx.Float32(
+                bo.buffer_load(rsrc(a["bias"]), lane + 64 * i, vec_width=1, dtype=T.f32)
+            )
+            for i in range(2)
+        ]
     got = c["mb"].poll(
         [
             (c["logit"], (t * EXPERTS + e) * ROUTER_PARTS + q * quarter + p, 2)
@@ -705,12 +715,6 @@ def stage_route(c, t):
                 tot = tot + fx.ptr_load(red + (qq * EXPERTS + lane + 64 * i))
             logits.append(tot)
         sc = [_sigmoid(logits[i]) for i in range(2)]
-        bias = [
-            fx.Float32(
-                bo.buffer_load(rsrc(a["bias"]), lane + 64 * i, vec_width=1, dtype=T.f32)
-            )
-            for i in range(2)
-        ]
         neg = fx.Float32(float("-inf"))
         val = [sc[i] + bias[i] for i in range(2)]
         val = [fx.isnan(v).select(neg, v) for v in val]
