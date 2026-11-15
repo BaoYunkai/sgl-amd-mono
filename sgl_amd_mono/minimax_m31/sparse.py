@@ -25,7 +25,7 @@ from sgl_amd_mono.common.ops import bf16_pair, clock, hw_exp2, hw_rcp, ld_i32, r
 
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
-from .index import e4m3_f16x2, fp4x2_f16
+from .index import e4m3_f16x2, fp4x2_f16, note_bad
 from .sync import _ptr, cta_sync, load_dev, store32, store128, store_dev, sync_acquire, sync_release
 
 SOURCES = kernel_sources(__name__)
@@ -51,7 +51,9 @@ CNT = PART + 16 * TOPK * STATE
 # read, row merged
 TL_POINTS = 6
 CNT_STRIDE = 32  # dwords: a counter a 128-byte line, so the rows' arrivals do not queue
-TL = CNT + 16 * CNT_STRIDE
+# inputs-out-of-range words (an OR of 1 slot, 2 length, 4 block; the largest value)
+DBG = CNT + 16 * CNT_STRIDE
+TL = DBG + CNT_STRIDE
 SCRATCH_BYTES = 4 * (TL + 2 * 16 * TOPK * TL_POINTS)
 
 
@@ -157,6 +159,8 @@ def build_sparse(key: SparseBuild):
         scratch: Int64,
         r2t_stride: Int32,
         max_pages: Int32,
+        r2t_rows: Int32,
+        r2t_len: Int32,
     ):
         _ = keyed
         a = {"out": out, "scratch": scratch, "timeline": key.timeline}
@@ -180,8 +184,18 @@ def build_sparse(key: SparseBuild):
         else:
             seq_len = fx.Int32(rocdl.readfirstlane(T.i32, ld_i32(seq, row)))
         req = fx.Int32(sload64(slot + fx.Int64(8 * row)))
-        valid = blk >= 0
-        bsafe = fx.max(blk, 0)
+        # inputs past the slot table (a padded or stale row) read inside it only
+        bad_req = (req < 0) | (req >= r2t_rows)
+        bad_len = seq_len > r2t_len
+        seq_len = fx.min(seq_len, r2t_len)
+        bad_blk = blk * BLOCK >= seq_len
+        if (tid == 0) & (bad_req | bad_len | bad_blk):
+            bits = bad_req.select(fx.Int32(1), fx.Int32(0)) | bad_len.select(fx.Int32(2), fx.Int32(0))
+            bits = bits | bad_blk.select(fx.Int32(4), fx.Int32(0))
+            note_bad(scratch, DBG, bits, fx.max(blk, seq_len))
+        req = bad_req.select(fx.Int32(0), req)
+        valid = (blk >= 0) & (~bad_blk)
+        bsafe = valid.select(blk, fx.Int32(0))
         s0 = fx.Int32(rocdl.readfirstlane(T.i32, ld_i32(r2t, req * r2t_stride + bsafe * BLOCK)))
         page = ((s0 // BLOCK) % max_pages + max_pages) % max_pages
         nvalid = valid.select(seq_len - bsafe * BLOCK, fx.Int32(0))
@@ -314,10 +328,12 @@ def build_sparse(key: SparseBuild):
         scratch: Int64,
         r2t_stride: Int32,
         max_pages: Int32,
+        r2t_rows: Int32,
+        r2t_len: Int32,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
-        ksparse(q, kp, ksc, vp, vsc, r2t, seq, slot, topk, out, scratch, r2t_stride, max_pages).launch(
+        ksparse(q, kp, ksc, vp, vsc, r2t, seq, slot, topk, out, scratch, r2t_stride, max_pages, r2t_rows, r2t_len).launch(
             grid=(s * TOPK,), block=(THREADS,), stream=stream
         )
 

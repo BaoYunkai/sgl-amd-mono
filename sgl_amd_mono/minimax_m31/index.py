@@ -45,10 +45,13 @@ PER_LANE = 16  # a lane's scores per pass of the top-k
 # scratch dwords: every row's block scores, then a counter a request
 SCORE = 0
 CNT = SCORE + 2 * DRAFT * MAX_BLOCKS
+# then the inputs-out-of-range words (DBG: an OR of 1 slot, 2 length; then the
+# largest length seen)
 # timeline stamps (i64): start, set up, scored, counter read, picked
 TL_POINTS = 5
 CNT_STRIDE = 32  # dwords: a counter a 128-byte line
-TL = CNT + 2 * CNT_STRIDE
+DBG = CNT + 2 * CNT_STRIDE
+TL = DBG + CNT_STRIDE
 SCRATCH_BYTES = 4 * (TL + 2 * BLOCKS * TL_POINTS)
 
 
@@ -182,6 +185,13 @@ def lds_wait():
     rocdl.sched_barrier(0)
 
 
+def note_bad(scratch, at, bit, value):
+    """Record an out-of-range input: OR ``bit`` into word ``at``, max ``value``
+    into word ``at + 1`` (host-side debugging reads them)."""
+    fx.llvm.atomic_or(_ptr(scratch, at, 32), fx.Int32(bit), syncscope="agent")
+    fx.llvm.atomic_max(_ptr(scratch, at + 1, 32), fx.Int32(value), syncscope="agent")
+
+
 def xshfl_lane(v, j):
     """Lane j's v, every lane."""
     return fx.Int32(rocdl.readlane(T.i32, fx.Int32(v), fx.Int32(j)))
@@ -211,6 +221,8 @@ def build_index(key: IndexBuild):
         scratch: Int64,
         r2t_stride: Int32,
         max_pages: Int32,
+        r2t_rows: Int32,
+        r2t_len: Int32,
     ):
         _ = keyed
         a = {"seq": seq, "out": out, "scratch": scratch, "seq_i64": key.seq_i64, "timeline": key.timeline}
@@ -245,13 +257,17 @@ def build_index(key: IndexBuild):
         # the C rows a lane holds: 4 g + i
         seqs, nbs = [], []
         for i in range_constexpr(4):
-            m = 4 * g + i
-            row = r * DRAFT + fx.min(m, DRAFT - 1)
+            m0 = 4 * g + i
+            row = r * DRAFT + fx.min(m0, DRAFT - 1)
             if const_expr(key.seq_i64):
                 sl = ld_i32(seq, 2 * row)
             else:
                 sl = ld_i32(seq, row)
-            sl = (m < DRAFT).select(sl, fx.Int32(0))
+            sl = (m0 < DRAFT).select(sl, fx.Int32(0))
+            # a length past the slot row (a padded or stale row) reads the row only
+            if sl > r2t_len:
+                note_bad(scratch, DBG, 2, sl)
+            sl = fx.min(sl, r2t_len)
             seqs.append(sl)
             nbs.append((sl + BLOCK - 1) // BLOCK)
         nblk = fx.Int32(0)
@@ -260,86 +276,91 @@ def build_index(key: IndexBuild):
         for off in (16, 32):
             nblk = fx.max(nblk, xshfl(nblk, off))
         req_slot = fx.Int32(sload64(slot + fx.Int64(8 * r * DRAFT)))
+        if (req_slot < 0) | (req_slot >= r2t_rows):
+            if tid == 0:
+                note_bad(scratch, DBG, 1, req_slot)
+            req_slot = fx.Int32(0)
         rp, rs = rsrc(pay), rsrc(sc)
         # the request's working CTAs: a block a wave while they last
         working = fx.min(fx.Int32(ctas), (nblk + WAVES - 1) // WAVES)
-        if bid // reqs >= working:
-            return
-        stamp(a, 1)
-        for blk in range(wi, nblk, working * WAVES):
-            s0 = ld_i32(r2t, req_slot * r2t_stride + blk * BLOCK)
-            page = ((s0 // BLOCK) % max_pages + max_pages) % max_pages
-            acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(8)]
-            kv = [
-                fx.Vector(
-                    bo.buffer_load(
-                        rp,
-                        (page * key.pay_page + (t * 16 + n16) * 64 + 16 * g) // 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
-                for t in range(8)
-            ]
-            sw = [
-                ld_i32(sc, (page * key.sc_page + (t * 16 + n16) * 8 + 4 * (g // 2)) // 4)
-                for t in range(8)
-            ]
-            for t in range_constexpr(8):
-                # scale bytes 2 g, 2 g + 1 of the token: dims 32 g .., 32 g + 16 ..
-                bits = sw[t] >> (16 * (g % 2))
-                sc0 = e4m3_f16x2(bits & 0xFF)
-                sc1 = e4m3_f16x2((bits >> 8) & 0xFF)
-                for kk in range_constexpr(4):
-                    word = fx.Int32(kv[t][kk])
-                    scale = sc0 if kk < 2 else sc1
-                    b8 = fx.Vector.from_elements(
-                        [fp4x2_f16(word, scale, j) for j in range(4)], fx.Int32
-                    )
-                    acc[t] = fx.Vector(
-                        rocdl.mfma_f32_16x16x32_f16(
-                            T.vec(4, T.f32),
-                            [qa[kk].bitcast(fx.Float16), b8.bitcast(fx.Float16), acc[t]],
+        # CTAs past the request's working ones skip to the end (a return inside a
+        # traced branch does not end the kernel)
+        if bid // reqs < working:
+            stamp(a, 1)
+            for blk in range(wi, nblk, working * WAVES):
+                s0 = ld_i32(r2t, req_slot * r2t_stride + blk * BLOCK)
+                page = ((s0 // BLOCK) % max_pages + max_pages) % max_pages
+                acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(8)]
+                kv = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            rp,
+                            (page * key.pay_page + (t * 16 + n16) * 64 + 16 * g) // 4,
+                            vec_width=4,
+                            dtype=T.i32,
                         )
                     )
-            # C element i of lane l: row 4 g + i, token 16 t + n16
-            for i in range_constexpr(4):
-                mx = fx.Float32(float("-inf"))
+                    for t in range(8)
+                ]
+                sw = [
+                    ld_i32(sc, (page * key.sc_page + (t * 16 + n16) * 8 + 4 * (g // 2)) // 4)
+                    for t in range(8)
+                ]
                 for t in range_constexpr(8):
-                    pos = blk * BLOCK + t * 16 + n16
-                    v = acc[t][i]
-                    mx = fx.max(mx, (pos < seqs[i]).select(v, fx.Float32(float("-inf"))))
-                for off in (8, 4, 2, 1):
-                    mx = fx.max(mx, xshfl(mx, off))
-                m = 4 * g + i
-                score = (blk >= nbs[i] - 1).select(
-                    fx.Float32(FORCED), mx * fx.Float32(SM_SCALE * LOG2E)
-                )
-                if (n16 == 0) & (m < DRAFT) & (blk < nbs[i]):
-                    store_dev(scratch, SCORE + (r * DRAFT + m) * MAX_BLOCKS + blk, [score.bitcast(fx.Int32)])
-        cta_sync(drain=True)
-        stamp(a, 2)
-        if tid == 0:
-            old = fx.Int32(0)
-            if working > 1:
-                sync_release("agent")
-                old = fx.llvm.atomic_add(
-                    _ptr(scratch, CNT + r * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent"
-                )
-            fx.ptr_store(old, lds.last.ptr)
-        gpu.barrier()
-        stamp(a, 3)
-        if fx.ptr_load(lds.last.ptr) == working - 1:
-            sync_acquire("agent")
-            if (tid == 0) & (working > 1):
-                store32(scratch, CNT + r * CNT_STRIDE, 0, "agent")
-            mine = nbs[0]
-            for i in range_constexpr(1, 4):
-                mine = (wave % 4 == i).select(nbs[i], mine)
-            row_nblk = fx.Int32(rocdl.readlane(T.i32, mine, 16 * (wave // 4)))
-            pick_row(a, r, wave, lane, lds.slots.ptr + wave * 2 * 64 * PER_LANE, row_nblk)
+                    # scale bytes 2 g, 2 g + 1 of the token: dims 32 g .., 32 g + 16 ..
+                    bits = sw[t] >> (16 * (g % 2))
+                    sc0 = e4m3_f16x2(bits & 0xFF)
+                    sc1 = e4m3_f16x2((bits >> 8) & 0xFF)
+                    for kk in range_constexpr(4):
+                        word = fx.Int32(kv[t][kk])
+                        scale = sc0 if kk < 2 else sc1
+                        b8 = fx.Vector.from_elements(
+                            [fp4x2_f16(word, scale, j) for j in range(4)], fx.Int32
+                        )
+                        acc[t] = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_f16(
+                                T.vec(4, T.f32),
+                                [qa[kk].bitcast(fx.Float16), b8.bitcast(fx.Float16), acc[t]],
+                            )
+                        )
+                # C element i of lane l: row 4 g + i, token 16 t + n16
+                for i in range_constexpr(4):
+                    mx = fx.Float32(float("-inf"))
+                    for t in range_constexpr(8):
+                        pos = blk * BLOCK + t * 16 + n16
+                        v = acc[t][i]
+                        mx = fx.max(mx, (pos < seqs[i]).select(v, fx.Float32(float("-inf"))))
+                    for off in (8, 4, 2, 1):
+                        mx = fx.max(mx, xshfl(mx, off))
+                    mm = 4 * g + i
+                    score = (blk >= nbs[i] - 1).select(
+                        fx.Float32(FORCED), mx * fx.Float32(SM_SCALE * LOG2E)
+                    )
+                    if (n16 == 0) & (mm < DRAFT) & (blk < nbs[i]):
+                        store_dev(scratch, SCORE + (r * DRAFT + mm) * MAX_BLOCKS + blk, [score.bitcast(fx.Int32)])
             cta_sync(drain=True)
-            stamp(a, 4)
+            stamp(a, 2)
+            if tid == 0:
+                old = fx.Int32(0)
+                if working > 1:
+                    sync_release("agent")
+                    old = fx.llvm.atomic_add(
+                        _ptr(scratch, CNT + r * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent"
+                    )
+                fx.ptr_store(old, lds.last.ptr)
+            gpu.barrier()
+            stamp(a, 3)
+            if fx.ptr_load(lds.last.ptr) == working - 1:
+                sync_acquire("agent")
+                if (tid == 0) & (working > 1):
+                    store32(scratch, CNT + r * CNT_STRIDE, 0, "agent")
+                mine = nbs[0]
+                for i in range_constexpr(1, 4):
+                    mine = (wave % 4 == i).select(nbs[i], mine)
+                row_nblk = fx.Int32(rocdl.readlane(T.i32, mine, 16 * (wave // 4)))
+                pick_row(a, r, wave, lane, lds.slots.ptr + wave * 2 * 64 * PER_LANE, row_nblk)
+                cta_sync(drain=True)
+                stamp(a, 4)
 
     @flyc.jit
     def launch(
@@ -353,10 +374,12 @@ def build_index(key: IndexBuild):
         scratch: Int64,
         r2t_stride: Int32,
         max_pages: Int32,
+        r2t_rows: Int32,
+        r2t_len: Int32,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
-        kindex(iq, pay, sc, r2t, seq, slot, out, scratch, r2t_stride, max_pages).launch(
+        kindex(iq, pay, sc, r2t, seq, slot, out, scratch, r2t_stride, max_pages, r2t_rows, r2t_len).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
