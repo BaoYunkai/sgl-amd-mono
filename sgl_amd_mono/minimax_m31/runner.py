@@ -316,3 +316,59 @@ class IndexRunner:
             self._compiled[key] = flyc.compile(build_index(key), *args)
         self._compiled[key](*args)
         return out
+
+
+class SparseRunner:
+    """Host side of the verify sparse attention (``sparse.py``): a compiled kernel per
+    row count and K / V pool layout, one scratch region (every row's blocks' softmax
+    states and a counter a row, which the row's last CTA resets)."""
+
+    def __init__(self, device: torch.device) -> None:
+        from .sparse import SCRATCH_BYTES
+
+        _writable_flydsl_cache()
+        self.scratch = torch.zeros(SCRATCH_BYTES, dtype=torch.uint8, device=device)
+        self._compiled: dict[Any, Any] = {}
+
+    def __call__(self, q, k, v, req_to_token, seq_lens, slot_ids, topk):
+        """``q``: the rows' Q ([rows, 16 x 128] bf16); ``k`` / ``v``: the layer's main
+        K / V ``Nvfp4Cache``; ``topk``: [1, rows, 16] block ids. Returns the attention
+        output, o_proj's input ([rows, 2048] bf16)."""
+        import flydsl.compiler as flyc
+
+        from .sparse import HEAD, HEADS, SparseBuild, build_sparse
+
+        rows = q.shape[0]
+        assert q.dtype == torch.bfloat16 and q.is_contiguous() and q.numel() == rows * HEADS * HEAD
+        assert k.payload.dim() == 4 and k.payload.shape[1] == 1
+        assert v.payload.stride() == k.payload.stride() and v.scales.stride() == k.scales.stride()
+        assert topk.dtype == torch.int32 and topk.is_contiguous() and topk.shape == (1, rows, 16)
+        key = SparseBuild(
+            tokens=rows,
+            pay_page=k.payload.stride(0),
+            pay_row=k.payload.stride(2),
+            sc_page=k.scales.stride(0),
+            sc_row=k.scales.stride(2),
+            seq_i64=seq_lens.dtype == torch.int64,
+        )
+        out = torch.empty(rows, HEADS * HEAD, dtype=torch.bfloat16, device=q.device)
+        args = (
+            q.data_ptr(),
+            k.payload.data_ptr(),
+            k.scales.data_ptr(),
+            v.payload.data_ptr(),
+            v.scales.data_ptr(),
+            req_to_token.data_ptr(),
+            seq_lens.data_ptr(),
+            slot_ids.data_ptr(),
+            topk.data_ptr(),
+            out.data_ptr(),
+            self.scratch.data_ptr(),
+            req_to_token.stride(0),
+            k.payload.shape[0],
+            torch.cuda.current_stream(),
+        )
+        if key not in self._compiled:
+            self._compiled[key] = flyc.compile(build_sparse(key), *args)
+        self._compiled[key](*args)
+        return out

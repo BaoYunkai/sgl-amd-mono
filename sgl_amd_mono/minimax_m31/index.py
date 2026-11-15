@@ -47,7 +47,8 @@ SCORE = 0
 CNT = SCORE + 2 * DRAFT * MAX_BLOCKS
 # timeline stamps (i64): start, set up, scored, counter read, picked
 TL_POINTS = 5
-TL = CNT + 64
+CNT_STRIDE = 32  # dwords: a counter a 128-byte line
+TL = CNT + 2 * CNT_STRIDE
 SCRATCH_BYTES = 4 * (TL + 2 * BLOCKS * TL_POINTS)
 
 
@@ -323,7 +324,7 @@ def build_index(key: IndexBuild):
             if working > 1:
                 sync_release("agent")
                 old = fx.llvm.atomic_add(
-                    _ptr(scratch, CNT + r, 32), fx.Int32(1), syncscope="agent"
+                    _ptr(scratch, CNT + r * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent"
                 )
             fx.ptr_store(old, lds.last.ptr)
         gpu.barrier()
@@ -331,7 +332,7 @@ def build_index(key: IndexBuild):
         if fx.ptr_load(lds.last.ptr) == working - 1:
             sync_acquire("agent")
             if (tid == 0) & (working > 1):
-                store32(scratch, CNT + r, 0, "agent")
+                store32(scratch, CNT + r * CNT_STRIDE, 0, "agent")
             mine = nbs[0]
             for i in range_constexpr(1, 4):
                 mine = (wave % 4 == i).select(nbs[i], mine)

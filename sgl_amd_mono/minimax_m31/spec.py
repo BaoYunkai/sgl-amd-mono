@@ -368,9 +368,15 @@ def front_disable_reasons(layer) -> list[str]:
         1,
     ) or (attn.head_dim, attn.rotary_dim) != (front.HEAD, 64):
         return ["attention head layout"]
-    scales = (attn.attn.k_scale_float, attn.attn.v_scale_float, attn.attn.idx_k_scale_float)
+    scales = (
+        attn.attn.q_scale_float,
+        attn.attn.k_scale_float,
+        attn.attn.v_scale_float,
+        attn.attn.idx_q_scale_float,
+        attn.attn.idx_k_scale_float,
+    )
     if any(v not in (None, 1.0) for v in scales):
-        return [f"K / V / index K scales {scales}: the NVFP4 pool takes unit ones"]
+        return [f"Q / K / V / index Q / index K scales {scales}: the launches take unit ones"]
     return []
 
 
@@ -394,7 +400,15 @@ class _Built:
     """One rank's FFN launcher, every sparse layer's weights, and the forward."""
 
     def __init__(
-        self, lm, runner, peer, weights: dict, sparse: list[int], front=None, index=None
+        self,
+        lm,
+        runner,
+        peer,
+        weights: dict,
+        sparse: list[int],
+        front=None,
+        index=None,
+        attend=None,
     ):
         self.lm, self.model = lm, lm.model
         self.runner, self.peer, self.weights = runner, peer, weights
@@ -405,6 +419,8 @@ class _Built:
         self._front_caches: dict[int, tuple] = {}
         # the verify indexer launch (IndexRunner) under the front, or None
         self.index = index
+        # the verify sparse attention launch (SparseRunner) under the indexer, or None
+        self.attend = attend
 
     def _front_pool(self, layer, lid):
         """Layer lid's write views of SGLang's NVFP4 pool, or None off it."""
@@ -485,8 +501,8 @@ class _Built:
 
     def _attend(self, layer, q, iq, caches, sparse):
         """Layer's sparse attention on the step's Q and index Q: the indexer launch's
-        top-k, then SGLang's NVFP4 sparse decode on it (``cached_topk_idx`` skips
-        SGLang's own scoring and top-k)."""
+        top-k, then the sparse attention launch, or SGLang's NVFP4 sparse decode on it
+        (``cached_topk_idx`` skips SGLang's own scoring and top-k)."""
         from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
             minimax_sparse_decode,
         )
@@ -496,6 +512,10 @@ class _Built:
         rows = q.shape[0]
         k, v, ik = caches
         topk = self.index(iq, ik, sparse.req_to_token, meta.seq_lens, meta.req_pool_indices)
+        if self.attend is not None:
+            return self.attend(
+                q, k, v, sparse.req_to_token, meta.seq_lens, meta.req_pool_indices, topk
+            )
         _, o = minimax_sparse_decode(
             q.view(rows, -1, 128),
             None,
@@ -712,7 +732,13 @@ def build(model, hf_config, ctx):
 
         index = IndexRunner(device)
         logger.info("M3.1 verify indexer launch under the front")
-    return _Built(model, runner, peer, weights, sparse, front, index)
+    attend = None
+    if index is not None and os.environ.get("SGLANG_AMD_MONO_M31_SPARSE", "1") == "1":
+        from sgl_amd_mono.minimax_m31.runner import SparseRunner
+
+        attend = SparseRunner(device)
+        logger.info("M3.1 verify sparse attention launch under the indexer")
+    return _Built(model, runner, peer, weights, sparse, front, index, attend)
 
 
 # check mode, 2 runs of 16 GSM8K prompts (49,476 and 44,004 launches); worst case:
