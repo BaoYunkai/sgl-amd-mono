@@ -42,6 +42,8 @@ from sgl_amd_mono.minimax_m31.drafter import runner as R
 logger = logging.getLogger(__name__)
 
 ENV = "SGLANG_AMD_MONO_M31_DRAFT"
+# the verify's context K / V rows through SGLang's fused write (one GEMM, one launch)
+KV_ENV = "SGLANG_AMD_MONO_M31_DRAFT_KV"
 TP = 4
 _CKPT = re.compile(
     r"(?:language_model\.)?model\.dspark\.layers\.(?P<i>\d+)\.decoder_layer\."
@@ -70,8 +72,14 @@ SGLANG_READS = {
         "forward(input_embeds)",
         "decoder_layer",
         "block_size",
+        "_build_fused_kv_write_bundle",
     ),
-    "srt/models/dspark.py": ("forward_embed",),
+    "srt/models/dspark.py": (
+        "forward_embed",
+        "_fused_kv_write_layout",
+        "_fused_kv_write_layout(project)",
+        "_fused_kv_write_cache",
+    ),
     "srt/models/minimax_m3.py": (
         "rotary_emb",
         "q_norm",
@@ -184,6 +192,19 @@ class _Draft:
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=h)
 
 
+def _kv_project(runner):
+    """``project`` of SGLang's fused context-KV write: the context hidden -> every layer's
+    [K | V] columns, layer-major, against the draft's MXFP8 K / V rows dequantized once
+    (bf16 holds e4m3 x 2^e exactly)."""
+    w, s = runner.packed["qkv"]
+    rows = slice(layout.QS, layout.QKV_N)
+    q = w[:, rows].reshape(-1, layout.HIDDEN).view(torch.float8_e4m3fn).float()
+    e = s[:, rows].reshape(-1, layout.HIDDEN // 32).float() - 127
+    weight = (q.view(q.shape[0], -1, 32) * torch.exp2(e)[..., None]).view(q.shape)
+    weight = weight.to(torch.bfloat16).contiguous()
+    return lambda x: torch.nn.functional.linear(x.to(weight.dtype), weight)
+
+
 def _build(model, hf_config, ctx) -> _Draft:
     from sglang.srt.runtime_context import get_parallel
 
@@ -198,6 +219,11 @@ def _build(model, hf_config, ctx) -> _Draft:
     )
     for key in [k for k in ctx.copies if k[0] == "m31 draft"]:
         del ctx.copies[key]
+    if os.environ.get(KV_ENV, "1") == "1":
+        # SGLang's fused write takes any projection; the MiniMax draft offers none on ROCm
+        project = _kv_project(runner)
+        model._build_fused_kv_write_bundle = lambda pool: model._fused_kv_write_layout(pool, project=project)
+        model._fused_kv_write_cache = None
     logger.info("monokernel: MiniMax-M3.1 DSpark draft attached (5 layers and the final norm a launch)")
     return _Draft(model, original, runner)
 
