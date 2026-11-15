@@ -284,7 +284,9 @@ def watch_bad_inputs(name: str, scratch: torch.Tensor, at: int) -> None:
         while True:
             time.sleep(5)
             try:
-                with urllib.request.urlopen("http://127.0.0.1:31000/v1/models", timeout=5) as r:
+                with urllib.request.urlopen(
+                    "http://127.0.0.1:31000/v1/models", timeout=5
+                ) as r:
                     if r.status == 200:
                         break
             except Exception:  # noqa: BLE001
@@ -297,7 +299,9 @@ def watch_bad_inputs(name: str, scratch: torch.Tensor, at: int) -> None:
                 if bits:
                     words.zero_()
             if bits:
-                log.warning("%s saw out-of-range inputs: bits %d, largest %d", name, bits, value)
+                log.warning(
+                    "%s saw out-of-range inputs: bits %d, largest %d", name, bits, value
+                )
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -327,7 +331,10 @@ class IndexRunner:
         rows = iq.shape[0]
         assert iq.dtype == torch.bfloat16 and iq.is_contiguous()
         assert cache.payload.dim() == 3 and cache.payload.shape[1] == BLOCK
-        assert slot_ids.dtype == torch.int64 and seq_lens.dtype in (torch.int32, torch.int64)
+        assert slot_ids.dtype == torch.int64 and seq_lens.dtype in (
+            torch.int32,
+            torch.int64,
+        )
         assert req_to_token.dtype == torch.int32 and req_to_token.stride(1) == 1
         key = IndexBuild(
             tokens=rows,
@@ -379,10 +386,21 @@ class SparseRunner:
         from .sparse import HEAD, HEADS, SparseBuild, build_sparse
 
         rows = q.shape[0]
-        assert q.dtype == torch.bfloat16 and q.is_contiguous() and q.numel() == rows * HEADS * HEAD
+        assert (
+            q.dtype == torch.bfloat16
+            and q.is_contiguous()
+            and q.numel() == rows * HEADS * HEAD
+        )
         assert k.payload.dim() == 4 and k.payload.shape[1] == 1
-        assert v.payload.stride() == k.payload.stride() and v.scales.stride() == k.scales.stride()
-        assert topk.dtype == torch.int32 and topk.is_contiguous() and topk.shape == (1, rows, 16)
+        assert (
+            v.payload.stride() == k.payload.stride()
+            and v.scales.stride() == k.scales.stride()
+        )
+        assert (
+            topk.dtype == torch.int32
+            and topk.is_contiguous()
+            and topk.shape == (1, rows, 16)
+        )
         key = SparseBuild(
             tokens=rows,
             pay_page=k.payload.stride(0),

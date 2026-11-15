@@ -16,15 +16,30 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu
-from flydsl.expr import math as fmath
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from sgl_amd_mono.common.ops import ballot, clock, lanes_below, ld_i32, popcount, rsrc, sload64, xshfl
+from sgl_amd_mono.common.ops import (
+    ballot,
+    clock,
+    lanes_below,
+    ld_i32,
+    popcount,
+    rsrc,
+    sload64,
+    xshfl,
+)
 from sgl_amd_mono.common.plan import THREADS, WAVES, kernel_sources, key_tuple
 
-from .sync import _ptr, cta_sync, load_dev, store32, store_dev, sync_acquire, sync_release
+from .sync import (
+    _ptr,
+    cta_sync,
+    load_dev,
+    store32,
+    store_dev,
+    sync_acquire,
+    sync_release,
+)
 
 SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
@@ -72,7 +87,9 @@ def kernel_name(key: IndexBuild) -> str:
 def stamp(a, k):
     if const_expr(a["timeline"]):  # noqa: SIM102
         if fx.thread_idx.x == 0:
-            bo.buffer_store(clock(), rsrc(a["scratch"]), TL // 2 + fx.block_idx.x * TL_POINTS + k)
+            bo.buffer_store(
+                clock(), rsrc(a["scratch"]), TL // 2 + fx.block_idx.x * TL_POINTS + k
+            )
 
 
 def order_key(score):
@@ -225,7 +242,13 @@ def build_index(key: IndexBuild):
         r2t_len: Int32,
     ):
         _ = keyed
-        a = {"seq": seq, "out": out, "scratch": scratch, "seq_i64": key.seq_i64, "timeline": key.timeline}
+        a = {
+            "seq": seq,
+            "out": out,
+            "scratch": scratch,
+            "seq_i64": key.seq_i64,
+            "timeline": key.timeline,
+        }
         bid, tid = fx.block_idx.x, fx.thread_idx.x
         lane, wave = tid % 64, tid // 64
         lds = fx.SharedAllocator().allocate(Lds).peek()
@@ -237,7 +260,14 @@ def build_index(key: IndexBuild):
         # a lane's 32 dims are contiguous, as its K payload bytes are
         qrow = r * DRAFT + fx.min(n16, DRAFT - 1)
         qv = [
-            fx.Vector(bo.buffer_load(rsrc(iq), qrow * (HEAD // 2) + 16 * g + 4 * j, vec_width=4, dtype=T.i32))
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(iq),
+                    qrow * (HEAD // 2) + 16 * g + 4 * j,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
             for j in range(4)
         ]
         qa = []
@@ -247,7 +277,10 @@ def build_index(key: IndexBuild):
                 w = fx.Int32(qv[kk][d])
                 lo, hi = (w << 16).bitcast(fx.Float32), (w & -65536).bitcast(fx.Float32)
                 zero = n16 >= DRAFT
-                lo, hi = zero.select(fx.Float32(0.0), lo), zero.select(fx.Float32(0.0), hi)
+                lo, hi = (
+                    zero.select(fx.Float32(0.0), lo),
+                    zero.select(fx.Float32(0.0), hi),
+                )
                 halves.append(
                     fx.Vector.from_elements([lo, hi], fx.Float32)
                     .to(fx.Float16)
@@ -303,7 +336,10 @@ def build_index(key: IndexBuild):
                     for t in range(8)
                 ]
                 sw = [
-                    ld_i32(sc, (page * key.sc_page + (t * 16 + n16) * 8 + 4 * (g // 2)) // 4)
+                    ld_i32(
+                        sc,
+                        (page * key.sc_page + (t * 16 + n16) * 8 + 4 * (g // 2)) // 4,
+                    )
                     for t in range(8)
                 ]
                 for t in range_constexpr(8):
@@ -320,7 +356,11 @@ def build_index(key: IndexBuild):
                         acc[t] = fx.Vector(
                             rocdl.mfma_f32_16x16x32_f16(
                                 T.vec(4, T.f32),
-                                [qa[kk].bitcast(fx.Float16), b8.bitcast(fx.Float16), acc[t]],
+                                [
+                                    qa[kk].bitcast(fx.Float16),
+                                    b8.bitcast(fx.Float16),
+                                    acc[t],
+                                ],
                             )
                         )
                 # C element i of lane l: row 4 g + i, token 16 t + n16
@@ -329,7 +369,9 @@ def build_index(key: IndexBuild):
                     for t in range_constexpr(8):
                         pos = blk * BLOCK + t * 16 + n16
                         v = acc[t][i]
-                        mx = fx.max(mx, (pos < seqs[i]).select(v, fx.Float32(float("-inf"))))
+                        mx = fx.max(
+                            mx, (pos < seqs[i]).select(v, fx.Float32(float("-inf")))
+                        )
                     for off in (8, 4, 2, 1):
                         mx = fx.max(mx, xshfl(mx, off))
                     mm = 4 * g + i
@@ -337,7 +379,11 @@ def build_index(key: IndexBuild):
                         fx.Float32(FORCED), mx * fx.Float32(SM_SCALE * LOG2E)
                     )
                     if (n16 == 0) & (mm < DRAFT) & (blk < nbs[i]):
-                        store_dev(scratch, SCORE + (r * DRAFT + mm) * MAX_BLOCKS + blk, [score.bitcast(fx.Int32)])
+                        store_dev(
+                            scratch,
+                            SCORE + (r * DRAFT + mm) * MAX_BLOCKS + blk,
+                            [score.bitcast(fx.Int32)],
+                        )
             cta_sync(drain=True)
             stamp(a, 2)
             if tid == 0:
@@ -345,7 +391,9 @@ def build_index(key: IndexBuild):
                 if working > 1:
                     sync_release("agent")
                     old = fx.llvm.atomic_add(
-                        _ptr(scratch, CNT + r * CNT_STRIDE, 32), fx.Int32(1), syncscope="agent"
+                        _ptr(scratch, CNT + r * CNT_STRIDE, 32),
+                        fx.Int32(1),
+                        syncscope="agent",
                     )
                 fx.ptr_store(old, lds.last.ptr)
             gpu.barrier()
@@ -358,7 +406,9 @@ def build_index(key: IndexBuild):
                 for i in range_constexpr(1, 4):
                     mine = (wave % 4 == i).select(nbs[i], mine)
                 row_nblk = fx.Int32(rocdl.readlane(T.i32, mine, 16 * (wave // 4)))
-                pick_row(a, r, wave, lane, lds.slots.ptr + wave * 2 * 64 * PER_LANE, row_nblk)
+                pick_row(
+                    a, r, wave, lane, lds.slots.ptr + wave * 2 * 64 * PER_LANE, row_nblk
+                )
                 cta_sync(drain=True)
                 stamp(a, 4)
 
@@ -379,9 +429,20 @@ def build_index(key: IndexBuild):
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
-        kindex(iq, pay, sc, r2t, seq, slot, out, scratch, r2t_stride, max_pages, r2t_rows, r2t_len).launch(
-            grid=(BLOCKS,), block=(THREADS,), stream=stream
-        )
+        kindex(
+            iq,
+            pay,
+            sc,
+            r2t,
+            seq,
+            slot,
+            out,
+            scratch,
+            r2t_stride,
+            max_pages,
+            r2t_rows,
+            r2t_len,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
 
@@ -389,7 +450,9 @@ def build_index(key: IndexBuild):
 def e4m3_f16x2(byte):
     """An E4M3 byte (low 8 bits) as two f16 (exact)."""
     pair = fx.Vector(
-        rocdl.cvt_pk_f32_fp8(res=fx.Vector.make_type(2, fx.Float32), src=byte, word_sel=False)
+        rocdl.cvt_pk_f32_fp8(
+            res=fx.Vector.make_type(2, fx.Float32), src=byte, word_sel=False
+        )
     )
     return fx.Vector.from_elements([pair[0], pair[0]], fx.Float32).to(fx.Float16)
 
@@ -400,7 +463,10 @@ def fp4x2_f16(word, scale, j):
     scale), so the E4M3 scale multiplies after: e2m1 x E4M3 is exact in f16."""
     pair = fx.Vector(
         rocdl.cvt_scalef32_pk_f16_fp4(
-            T.vec(2, T.f16), as_ir_value(fx.Int32(word)), as_ir_value(fx.Float32(1.0)), j
+            T.vec(2, T.f16),
+            as_ir_value(fx.Int32(word)),
+            as_ir_value(fx.Float32(1.0)),
+            j,
         )
     )
     return (pair * scale).bitcast(fx.Int32)[0]
