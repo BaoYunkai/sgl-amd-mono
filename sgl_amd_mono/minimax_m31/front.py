@@ -48,6 +48,7 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     ld_i32,
     rsrc,
+    sload64,
     xshfl,
 )
 from sgl_amd_mono.common.plan import THREADS, kernel_sources, key_tuple
@@ -69,6 +70,8 @@ CHUNKS = HIDDEN // CHUNK
 BLOCKS = HEADS * CHUNKS
 STEPS = CHUNK // 64  # the chunk's 64-wide K steps, two an MFMA
 ROPE_HALF = 32  # NeoX pairs columns d and d + 32 of the 64 rotary ones
+XCDS = 8
+assert BLOCKS == XCDS * (2 * CHUNKS + (HEADS - 2 * XCDS) * CHUNKS // XCDS)
 
 # scratch dwords: every CTA's partial, its rows' sums of squares, a counter a head
 PART = 0
@@ -103,6 +106,17 @@ class FrontBuild:
 
     def ik_strides(self):
         return (self.ik_pay_page, self.ik_pay_row), (self.ik_sc_page, self.ik_sc_row)
+
+
+def head_chunk(bid):
+    """CTA ``bid``'s (head, chunk). CTAs go to the 8 XCDs round-robin: a Q head's
+    chunks share one XCD's L2 (heads x and x + 8 on XCD x), the K, V and index heads
+    two (6 chunks on each), so a head's partials and counter stay near its last CTA."""
+    x, j = bid % XCDS, bid // XCDS
+    lo = j < 2 * CHUNKS
+    h = lo.select(x + XCDS * (j // CHUNKS), K_HEAD + x // 2)
+    c = lo.select(j % CHUNKS, (x % 2) * (CHUNKS // 2) + j - 2 * CHUNKS)
+    return h, c
 
 
 def kernel_name(key: FrontBuild) -> str:
@@ -282,25 +296,14 @@ def build_front(key: FrontBuild):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
         lane, wave = tid % 64, tid // 64
-        h, c = bid // CHUNKS, bid % CHUNKS
+        h, c = head_chunk(bid)
+        slot = h * CHUNKS + c
         lds = fx.SharedAllocator().allocate(Lds).peek()
         xa, xsl, lastp = lds.xa.ptr, lds.xs.ptr, lds.last.ptr
         stamp(a, 0)
         k0 = c * CHUNK
-        # the head's last CTA's inputs (every CTA loads them; only it reads them):
-        # the slots and positions of the wave's rows wave + 8 k, the head's weight
-        # scales and norm weights
-        ks = [k for k in range(2) if 8 * k < s]
-        rows = [fx.min(wave + 8 * k, s - 1) for k in ks]
-        locs = [ld_i32(loc, 2 * r) for r in rows]
-        poss = [ld_i32(pos, 2 * r) for r in rows]
-        ws2 = fx.Vector(bo.buffer_load(rsrc(ws), h * HEAD + 2 * lane, vec_width=2, dtype=T.f32))
-        nwp = (h < Q_HEADS).select(
-            qn, (h == K_HEAD).select(kn, (h == IQ_HEAD).select(iqn, ikn))
-        )
-        nw = ld_i32(nwp, lane)
-        # row t's 16 columns 16 q .. of the chunk; rows past s read 0. Out before
-        # the weights: a wait on them waits on every earlier load
+        # row t's 16 columns 16 q .. of the chunk; rows past s read 0. Out first: a
+        # wait on a load waits on every earlier one
         t, q = tid // 32, tid % 32
         col = k0 + q * 16
         nbytes = s * HIDDEN * 2
@@ -317,6 +320,20 @@ def build_front(key: FrontBuild):
             fx.Vector(bo.buffer_load(rg, col // 2 + 4 * j, vec_width=4, dtype=T.i32))
             for j in range(2)
         ]
+        rocdl.sched_barrier(0)
+        # the head's last CTA's inputs (every CTA loads them; only it reads them):
+        # the slots and positions of the wave's rows wave + 8 k, the head's weight
+        # scales and norm weights
+        # (scalar loads: a uniform vector load's value would wait on the X loads)
+        ks = [k for k in range(2) if 8 * k < s]
+        rows = [fx.min(wave + 8 * k, s - 1) for k in ks]
+        locs = [fx.Int32(sload64(loc + fx.Int64(8 * r))) for r in rows]
+        poss = [fx.Int32(sload64(pos + fx.Int64(8 * r))) for r in rows]
+        ws2 = fx.Vector(bo.buffer_load(rsrc(ws), h * HEAD + 2 * lane, vec_width=2, dtype=T.f32))
+        nwp = (h < Q_HEADS).select(
+            qn, (h == K_HEAD).select(kn, (h == IQ_HEAD).select(iqn, ikn))
+        )
+        nw = ld_i32(nwp, lane)
         # the wave's tile over the chunk, AITER's (16, 16) shuffle as ``ffn.oproj``
         # reads it; the scheduler keeps the X loads ahead
         rocdl.sched_barrier(0)
@@ -377,7 +394,7 @@ def build_front(key: FrontBuild):
         if q == 0:
             fx.ptr_store(scale, xsl + t)
             if t < s:
-                store_dev(scratch, SSQ + bid * MAX_TOKENS + t, [sq.bitcast(fx.Int32)])
+                store_dev(scratch, SSQ + slot * MAX_TOKENS + t, [sq.bitcast(fx.Int32)])
         gpu.barrier()
         stamp(a, 1)
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -400,7 +417,7 @@ def build_front(key: FrontBuild):
                 v = acc[r] * fx.ptr_load(xsl + m)
                 store_dev(
                     scratch,
-                    PART + (bid * MAX_TOKENS + m) * HEAD + wave * 16 + lane % 16,
+                    PART + (slot * MAX_TOKENS + m) * HEAD + wave * 16 + lane % 16,
                     [v.bitcast(fx.Int32)],
                 )
         cta_sync(drain=True)
