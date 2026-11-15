@@ -67,6 +67,18 @@ SGLANG_READS = {
         '"_is_layer_to_capture"',
         "_norm_quant",
         "attn_boundary",
+        "input_layernorm",
+        "_fused_qkv_index",
+        "_can_use_rocm_sparse_qk_index_norm_rope_static",
+        "q_norm",
+        "k_norm",
+        "index_q_norm",
+        "index_k_norm",
+        "variance_epsilon",
+        "rotary_emb",
+        "_get_sparse_kv_pool",
+        "_mark_sparse_kv_cached_by_fusion",
+        "forward_core",
         "self_attn",
         "mlp",
         "experts",
@@ -83,7 +95,12 @@ SGLANG_READS = {
         "layers_to_capture",
         "finalize_norm",
     ),
-    "srt/models/minimax_common/amd/minimax_m3_hip.py": ("attn_quant_format",),
+    "srt/models/minimax_common/amd/minimax_m3_hip.py": (
+        "attn_quant_format",
+        "nvfp4_layer_caches",
+    ),
+    "srt/mem_cache/minimax_m3_nvfp4_pool.py": ("MiniMaxM3Nvfp4KVPool",),
+    "srt/layers/rotary_embedding/base.py": ("cos_sin_cache", "is_neox_style"),
     "srt/distributed/parallel_state.py": ("get_tp_group", "rank_in_group", "cpu_group"),
     "srt/runtime_context.py": ("get_parallel",),
     "srt/environ.py": ("envs",),
@@ -289,14 +306,113 @@ def _shared_mxfp8(copies: dict, i: int):
     )
 
 
+def front_disable_reasons(layer) -> list[str]:
+    """Why a sparse layer's attention front cannot run as one launch (``front.py``):
+    it replaces the input norm, the fused qkv + index projection and SGLang's fused
+    qk-norm / RoPE / NVFP4 store, whose static gate it inherits."""
+    from sgl_amd_mono.minimax_m31 import front
+
+    attn, norm = layer.self_attn, layer.input_layernorm
+    proj = getattr(attn, "_fused_qkv_index", None)
+    w = getattr(getattr(proj, "weight", None), "_ptpc_weight", None)
+    ws = getattr(getattr(proj, "weight", None), "_ptpc_scale", None)
+    if (
+        w is None
+        or w.dtype != torch.float8_e4m3fn
+        or tuple(w.shape) != (front.COLS, ffn.HIDDEN)
+        or ws is None
+        or ws.numel() != front.COLS
+    ):
+        return ["no rowwise-FP8 copy of the fused qkv + index projection"]
+    if type(norm).__name__ != "GemmaRMSNorm" or norm.variance_epsilon != ffn.EPS:
+        return [f"input norm {type(norm).__name__}"]
+    if not getattr(attn, "_can_use_rocm_sparse_qk_index_norm_rope_static", False):
+        return ["SGLang's fused qk-norm / RoPE store does not apply"]
+    if attn.q_norm.variance_epsilon != ffn.EPS or not attn.rotary_emb.is_neox_style:
+        return ["head norm eps or RoPE style"]
+    if (attn.num_heads, attn.num_kv_heads, attn.num_idx_heads) != (
+        front.Q_HEADS,
+        1,
+        1,
+    ) or (attn.head_dim, attn.rotary_dim) != (front.HEAD, 64):
+        return ["attention head layout"]
+    scales = (attn.attn.k_scale_float, attn.attn.v_scale_float, attn.attn.idx_k_scale_float)
+    if any(v not in (None, 1.0) for v in scales):
+        return [f"K / V / index K scales {scales}: the NVFP4 pool takes unit ones"]
+    return []
+
+
+def _front_weights(layer):
+    from types import SimpleNamespace
+
+    attn = layer.self_attn
+    w = attn._fused_qkv_index.weight
+    return SimpleNamespace(
+        input_norm=layer.input_layernorm.weight.data,
+        wqkv=w._ptpc_weight,
+        wqkv_scale=w._ptpc_scale.reshape(-1).contiguous(),
+        q_norm=attn.q_norm.weight.data,
+        k_norm=attn.k_norm.weight.data,
+        iq_norm=attn.index_q_norm.weight.data,
+        ik_norm=attn.index_k_norm.weight.data,
+    )
+
+
 class _Built:
     """One rank's FFN launcher, every sparse layer's weights, and the forward."""
 
-    def __init__(self, lm, runner, peer, weights: dict, sparse: list[int]):
+    def __init__(self, lm, runner, peer, weights: dict, sparse: list[int], front=None):
         self.lm, self.model = lm, lm.model
         self.runner, self.peer, self.weights = runner, peer, weights
         self.first, self.sparse = sparse[0], sparse
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
+        # (FrontRunner, {layer: weights}) for the sparse layers past the first
+        self.front = front
+        self._front_caches: dict[int, tuple] = {}
+
+    def _front_pool(self, layer, lid):
+        """Layer lid's write views of SGLang's NVFP4 pool, or None off it."""
+        caches = self._front_caches.get(lid)
+        if caches is None:
+            from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+            from sglang.srt.models.minimax_common.amd.minimax_m3_hip import (
+                nvfp4_layer_caches,
+            )
+
+            pool = layer.self_attn._get_sparse_kv_pool()
+            if not isinstance(pool, MiniMaxM3Nvfp4KVPool):
+                logger.info("M3.1 attention front off: the KV pool is %s", type(pool))
+                self.front = None
+                return None
+            caches = nvfp4_layer_caches(pool, layer.self_attn.attn.layer_id)
+            self._front_caches[lid] = caches
+        return caches
+
+    def _front(self, layer, lid, out, res_out, positions, forward_batch, aux):
+        """Layer lid's attention from the previous FFN launch's (output, residual):
+        the front launch, then SGLang's sparse attention on its Q and index Q, the
+        pool rows already stored. Returns (attention output, residual entering)."""
+        runner, weights = self.front
+        attn = layer.self_attn
+        caches = self._front_caches[lid]
+        res_new, q, iq = runner(
+            out,
+            res_out,
+            weights[lid],
+            positions,
+            forward_batch.out_cache_loc,
+            caches,
+            attn.rotary_emb.cos_sin_cache,
+        )
+        if getattr(layer, "_is_layer_to_capture", False):
+            aux.capture(res_new)
+        attn._mark_sparse_kv_cached_by_fusion(forward_batch, attn.attn.layer_id)
+        # K, V and index K: the attention reads the pool rows, not these
+        unused = q[:, : attn.head_dim]
+        inner = (q, unused, unused, iq, unused, None, forward_batch)
+        with _o_proj_input(attn.o_proj):
+            out_attn = attn.forward_core((None, forward_batch, inner))
+        return out_attn, res_new
 
     def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
         lm = self.lm
@@ -333,37 +449,54 @@ class _Built:
         slots = forward_batch.out_cache_loc
         stream = stream_of(forward_batch)
         check = self.check and not torch.cuda.is_current_stream_capturing()
+        # the previous sparse layer's (output, residual), while the stream holds
+        # neither: the front launch applies the residual add
+        held = None
         for lid in self.sparse:
             layer = m.layers[lid]
-            ref = self._reference(layer, positions, forward_batch, hidden) if check else None  # fmt: skip
-            call = {}
-            if getattr(layer, "_norm_quant", None) is not None:
-                call["quant_format"] = layer._norm_quant.attn_quant_format(rows)
-            x = layer.attn_boundary.prepare(
-                hidden,
-                forward_batch,
-                capture_gathered=aux
-                if getattr(layer, "_is_layer_to_capture", False)
-                else None,  # fmt: skip
-                **call,
+            front = (
+                held is not None
+                and not check
+                and self.front is not None
+                and self._front_pool(layer, lid) is not None
             )
-            with _o_proj_input(layer.self_attn.o_proj):
-                attn = layer.self_attn(
-                    positions=positions, hidden_states=x, forward_batch=forward_batch
+            if front:
+                attn, entering = self._front(layer, lid, *held, positions, forward_batch, aux)
+            else:
+                if held is not None:
+                    stream.write(held[1])
+                    hidden = stream.record(held[0], PLAIN_ADD)
+                ref = self._reference(layer, positions, forward_batch, hidden) if check else None  # fmt: skip
+                call = {}
+                if getattr(layer, "_norm_quant", None) is not None:
+                    call["quant_format"] = layer._norm_quant.attn_quant_format(rows)
+                x = layer.attn_boundary.prepare(
+                    hidden,
+                    forward_batch,
+                    capture_gathered=aux
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None,  # fmt: skip
+                    **call,
                 )
+                with _o_proj_input(layer.self_attn.o_proj):
+                    attn = layer.self_attn(
+                        positions=positions, hidden_states=x, forward_batch=forward_batch
+                    )
+                entering = stream.residual
             out, residual = self.runner(
                 attn.contiguous(),
-                stream.residual.contiguous(),
+                entering.contiguous(),
                 self.weights[lid],
                 slots,
             )
-            if ref is not None:
+            if not front and ref is not None:
                 from sgl_amd_mono.minimax.check import log_check
 
                 log_check(layer, lid, slots[:rows] > 0, (out, residual), ref, ffn.TOPK)
-            # the next layer's input norm applies the residual add
-            stream.write(residual)
-            hidden = stream.record(out, PLAIN_ADD)
+            held = (out, residual)
+        # the final norm applies the last residual add
+        stream.write(held[1])
+        hidden = stream.record(held[0], PLAIN_ADD)
         hidden = final_norm(
             hidden,
             forward_batch,
@@ -443,7 +576,23 @@ def build(model, hf_config, ctx):
         len(sparse),
         tuple(ctx.widths),
     )
-    return _Built(model, runner, peer, weights, sparse)
+    front = None
+    if os.environ.get("SGLANG_AMD_MONO_M31_FRONT", "1") == "1":
+        from sgl_amd_mono.minimax_m31.runner import FrontRunner
+
+        reasons = {
+            i: front_disable_reasons(model.model.layers[i]) for i in sparse[1:]
+        }
+        off = {i: r for i, r in reasons.items() if r}
+        if off:
+            logger.info("M3.1 attention front off: %s", next(iter(off.items())))
+        else:
+            front = (
+                FrontRunner(device, tuple(ctx.widths)),
+                {i: _front_weights(model.model.layers[i]) for i in sparse[1:]},
+            )
+            logger.info("M3.1 attention front launch: layers %d .. %d", sparse[1], sparse[-1])
+    return _Built(model, runner, peer, weights, sparse, front)
 
 
 # check mode, 2 runs of 16 GSM8K prompts (49,476 and 44,004 launches); worst case:

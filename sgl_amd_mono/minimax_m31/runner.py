@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host side of the FFN launch: one compiled kernel, scratch region and the
-shared epoch word per row count of one TP rank."""
+"""Host side of the FFN launch (one compiled kernel, scratch region and the shared
+epoch word per row count of one TP rank) and of the attention front."""
 
 from __future__ import annotations
 
@@ -169,3 +169,98 @@ class FfnRunner:
     def region(self, s: int, name: str) -> torch.Tensor:
         off, nbytes = scratch_layout(s)[name]
         return self.scratch[s][off : off + nbytes]
+
+
+class FrontRunner:
+    """Host side of the attention front (``front.py``): one compiled kernel per row
+    count for the NVFP4 pool's layout, one scratch region (a launch's partials and
+    every head's arrival counter, which the head's last CTA resets). Every width
+    compiles on the first call: the pool exists only inside a forward, and SGLang
+    runs a step eagerly before it captures one."""
+
+    def __init__(self, device: torch.device, widths: tuple[int, ...]) -> None:
+        from .front import SCRATCH_BYTES
+
+        _writable_flydsl_cache()
+        self.widths = widths
+        self.scratch = torch.zeros(SCRATCH_BYTES, dtype=torch.uint8, device=device)
+        self._compiled: dict[int, Any] = {}
+        self._layout = None
+
+    @staticmethod
+    def layout(caches, cos_sin: torch.Tensor) -> dict:
+        """The build parameters of a layer's pool views (``Nvfp4Cache`` K, V, index K)
+        and the RoPE cache."""
+        k, v, ik = caches
+        assert k.payload.dim() == 4 and k.payload.shape[1] == 1, k.payload.shape
+        assert v.payload.stride() == k.payload.stride()
+        assert v.scales.stride() == k.scales.stride()
+        assert ik.payload.dim() == 3 and ik.payload.shape[-2] == k.payload.shape[-2]
+        assert cos_sin.dim() == 2 and cos_sin.shape[1] == 64 and cos_sin.is_contiguous()
+        assert cos_sin.dtype in (torch.float32, torch.bfloat16)
+        return dict(
+            page=k.payload.shape[-2],
+            kv_pay_page=k.payload.stride(0),
+            kv_pay_row=k.payload.stride(2),
+            kv_sc_page=k.scales.stride(0),
+            kv_sc_row=k.scales.stride(2),
+            ik_pay_page=ik.payload.stride(0),
+            ik_pay_row=ik.payload.stride(1),
+            ik_sc_page=ik.scales.stride(0),
+            ik_sc_row=ik.scales.stride(1),
+            cos_bf16=cos_sin.dtype == torch.bfloat16,
+        )
+
+    def __call__(self, x, residual, w, positions, slots, caches, cos_sin):
+        """``x``: the previous FFN launch's output; ``residual``: its residual out;
+        ``w``: the layer's front weights; ``caches``: its pool views. Stores the
+        step's K, V and index K rows and returns (the residual entering the layer,
+        Q, index Q)."""
+        import flydsl.compiler as flyc
+
+        from .front import HEAD, Q_HEADS, FrontBuild, build_front
+
+        s = x.shape[0]
+        assert x.dtype == torch.bfloat16 and tuple(x.shape) == (s, HIDDEN)
+        assert x.is_contiguous() and residual.is_contiguous()
+        assert positions.dtype == torch.int64 and slots.dtype == torch.int64
+        assert positions.numel() >= s and slots.numel() >= s
+        layout = self.layout(caches, cos_sin)
+        if self._layout is None:
+            self._layout = layout
+        assert layout == self._layout, (layout, self._layout)
+        res_new = torch.empty_like(residual)
+        q = torch.empty(s, Q_HEADS * HEAD, dtype=torch.bfloat16, device=x.device)
+        iq = torch.empty(s, HEAD, dtype=torch.bfloat16, device=x.device)
+        k, v, ik = caches
+        args = (
+            x.data_ptr(),
+            residual.data_ptr(),
+            res_new.data_ptr(),
+            w.input_norm.data_ptr(),
+            w.wqkv.data_ptr(),
+            w.wqkv_scale.data_ptr(),
+            w.q_norm.data_ptr(),
+            w.k_norm.data_ptr(),
+            w.iq_norm.data_ptr(),
+            w.ik_norm.data_ptr(),
+            positions.data_ptr(),
+            cos_sin.data_ptr(),
+            slots.data_ptr(),
+            k.payload.data_ptr(),
+            k.scales.data_ptr(),
+            v.payload.data_ptr(),
+            v.scales.data_ptr(),
+            ik.payload.data_ptr(),
+            ik.scales.data_ptr(),
+            q.data_ptr(),
+            iq.data_ptr(),
+            self.scratch.data_ptr(),
+            torch.cuda.current_stream(),
+        )
+        if not self._compiled:
+            for width in self.widths:
+                launch = build_front(FrontBuild(tokens=width, **layout))
+                self._compiled[width] = flyc.compile(launch, *args)
+        self._compiled[s](*args)
+        return res_new, q, iq
