@@ -71,17 +71,25 @@ def main():
     vocab_start = rank * width
     w2s = w2[vocab_start : vocab_start + width]
     ops, x = markov.ops(), markov.Exchange(cpu, rank, tp, dev)
-    scratch = torch.empty(markov.MAX_SEQUENCES, markov.blocks(width), 2, dtype=torch.float32, device=dev)
+    scratch = torch.empty(
+        markov.MAX_SEQUENCES, markov.blocks(width), 2, dtype=torch.float32, device=dev
+    )
     key, gamma, fails = 0x1234_5678_9ABC, args.gamma, []
     for bs in range(1, markov.MAX_SEQUENCES + 1):
         gr = torch.Generator(device=dev).manual_seed(100 + 13 * rank + bs)
         base = (torch.randn(bs, gamma, width, generator=gr, device=dev) * 3).bfloat16()
         anchor = torch.randint(
-            0, VOCAB, (bs,), device=dev, generator=torch.Generator(device=dev).manual_seed(bs)
+            0,
+            VOCAB,
+            (bs,),
+            device=dev,
+            generator=torch.Generator(device=dev).manual_seed(bs),
         )
         temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=dev)
         offset0 = 17 * bs
-        want, want_logits = reference(base, w1, w2s, anchor, temps, key, offset0, vocab_start)
+        want, want_logits = reference(
+            base, w1, w2s, anchor, temps, key, offset0, vocab_start
+        )
         offset = torch.tensor([offset0], dtype=torch.int64, device=dev)
         out = torch.zeros(bs * gamma, dtype=torch.int64, device=dev)
         logits = torch.zeros(bs, gamma, width, dtype=torch.bfloat16, device=dev)

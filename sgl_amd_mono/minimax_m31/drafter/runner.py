@@ -29,7 +29,9 @@ SHARD_DIM = {
 WAIT_S = 10.0
 
 
-def shard(tensor: torch.Tensor, proj: str, kind: str, rank: int, tp: int) -> torch.Tensor:
+def shard(
+    tensor: torch.Tensor, proj: str, kind: str, rank: int, tp: int
+) -> torch.Tensor:
     """This rank's part of a checkpoint projection's weight or its e8m0 scales."""
     t = tensor.view(torch.uint8)
     dim = SHARD_DIM[proj]
@@ -41,7 +43,9 @@ class DraftRunner:
     """The draft launch of one TP4 rank. ``weights[layer][(proj, kind)]``: this rank's
     checkpoint shards (uint8). The K / V caches are bound at the first eager call."""
 
-    def __init__(self, model, weights, rank, cpu_group, device, deadline_s=WAIT_S, timeline=False):
+    def __init__(
+        self, model, weights, rank, cpu_group, device, deadline_s=WAIT_S, timeline=False
+    ):
         from sgl_amd_mono.common.peer import PeerBuffer
         from sgl_amd_mono.minimax_m31.drafter.layer import build_drafter
         from sgl_amd_mono.minimax_m31.runner import _writable_flydsl_cache
@@ -52,12 +56,21 @@ class DraftRunner:
         self.packed = {}
         for name, ((n, k), projs) in GEMV.items():
             w = torch.stack(
-                [torch.cat([weights[i][p, "weight"] for p in projs]) for i in range(layout.LAYERS)]
+                [
+                    torch.cat([weights[i][p, "weight"] for p in projs])
+                    for i in range(layout.LAYERS)
+                ]
             )
             s = torch.stack(
-                [torch.cat([weights[i][p, "weight_scale_inv"] for p in projs]) for i in range(layout.LAYERS)]
+                [
+                    torch.cat([weights[i][p, "weight_scale_inv"] for p in projs])
+                    for i in range(layout.LAYERS)
+                ]
             )
-            assert tuple(w.shape[1:]) == (n, k) and tuple(s.shape[1:]) == (n, k // 32), (name, w.shape, s.shape)
+            assert tuple(w.shape[1:]) == (n, k) and tuple(s.shape[1:]) == (
+                n,
+                k // 32,
+            ), (name, w.shape, s.shape)
             self.packed[name] = (w.to(dev).contiguous(), s.to(dev).contiguous())
         layers = model.layers
         self.norms = [
@@ -83,7 +96,9 @@ class DraftRunner:
         self.pe = [int(a) for a in self.peers.addresses.tolist()]
         self.health = torch.zeros(4, dtype=torch.int32, device=dev)
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.out = torch.empty(layout.MAX_ROWS, layout.HIDDEN, dtype=torch.bfloat16, device=dev)
+        self.out = torch.empty(
+            layout.MAX_ROWS, layout.HIDDEN, dtype=torch.bfloat16, device=dev
+        )
         self.launch = build_drafter(wait_ticks=int(deadline_s * 1e8), timeline=timeline)
         self.tab = None
         self._caches = None
@@ -99,7 +114,9 @@ class DraftRunner:
                     and t.dim() == 3
                     and tuple(t.shape[1:]) == (1, layout.HD)
                 ):
-                    raise RuntimeError(f"M3.1 draft KV cache {t.dtype} {tuple(t.shape)}")
+                    raise RuntimeError(
+                        f"M3.1 draft KV cache {t.dtype} {tuple(t.shape)}"
+                    )
         tab = torch.zeros(layout.LAYERS, 16, dtype=torch.int64)
         for i, ((k, v), ws) in enumerate(zip(caches, self.norms)):
             for j, w in enumerate(ws):
@@ -116,14 +133,25 @@ class DraftRunner:
         if self._caches is None:
             self._bind(pool)
         elif self._caches != [
-            (k.data_ptr(), v.data_ptr()) for k, v in (pool.get_kv_buffer(i) for i in self.layer_ids)
+            (k.data_ptr(), v.data_ptr())
+            for k, v in (pool.get_kv_buffer(i) for i in self.layer_ids)
         ]:
-            raise RuntimeError("M3.1 draft: the KV caches moved since the launch bound them")
+            raise RuntimeError(
+                "M3.1 draft: the KV caches moved since the launch bound them"
+            )
         r2t = backend.req_to_token_pool.req_to_token
-        rpi, seq, slots = forward_batch.req_pool_indices, forward_batch.seq_lens, forward_batch.out_cache_loc
+        rpi, seq, slots = (
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+        )
         rows = x.shape[0]
         assert rows in (layout.QPR, 2 * layout.QPR), rows
-        assert x.dtype == torch.bfloat16 and x.is_contiguous() and x.shape[1] == layout.HIDDEN
+        assert (
+            x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and x.shape[1] == layout.HIDDEN
+        )
         assert r2t.dtype == torch.int32 and r2t.is_contiguous()
         for t in (positions, rpi, seq, slots):
             assert t.dtype == torch.int64, t.dtype

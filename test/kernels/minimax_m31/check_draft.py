@@ -90,8 +90,12 @@ def reference(x, pos, prefix, nreq, r2t, caches, full, norms, fin, cos_sin, rank
                 t = r * Q + j
                 lo = max(0, prefix + j - (W - 1))
                 kp = s0[lo:prefix].long()
-                kk = torch.cat([caches[i][0][kp, 0].float()[:, None].expand(-1, 4, -1), kb])
-                vv = torch.cat([caches[i][1][kp, 0].float()[:, None].expand(-1, 4, -1), vb])
+                kk = torch.cat(
+                    [caches[i][0][kp, 0].float()[:, None].expand(-1, 4, -1), kb]
+                )
+                vv = torch.cat(
+                    [caches[i][1][kp, 0].float()[:, None].expand(-1, 4, -1), vb]
+                )
                 kh, vh = kk[:, torch.arange(64) // 16], vv[:, torch.arange(64) // 16]
                 sc = torch.einsum("hd,nhd->hn", q[t], kh) / HD**0.5
                 att[t] = torch.einsum("hn,nhd->hd", sc.softmax(-1), vh)
@@ -109,7 +113,9 @@ def restore(caches, saved):
         v.copy_(v0)
 
 
-def window_edges(runner, args, caches, saved, out, new_rows, r2t, nreq, prefix, slots, gs):
+def window_edges(
+    runner, args, caches, saved, out, new_rows, r2t, nreq, prefix, slots, gs
+):
     """The window past a long prefix, against the unchanged step (``out``, every layer's
     ``new_rows``) -> what went wrong. Layer 1's new K / V rows of a row hold layer 0's
     attention of that row alone, so they tell the rows' layer-0 windows apart."""
@@ -144,7 +150,9 @@ def window_edges(runner, args, caches, saved, out, new_rows, r2t, nreq, prefix, 
         moved = ((k1 != new_rows[1][0]) | (v1 != new_rows[1][1])).flatten(1).any(1)
         moved = moved.view(nreq, Q).cpu()
         if not torch.equal(moved, (torch.arange(Q) <= j).expand(nreq, Q)):
-            bad.append(f"the key at row 0's window start + {j} reached rows {moved.int().tolist()}")
+            bad.append(
+                f"the key at row 0's window start + {j} reached rows {moved.int().tolist()}"
+            )
     restore(caches, saved)
     return bad
 
@@ -170,10 +178,14 @@ def main():
     for i in range(L):
         wl = {}
         for p, (n, k) in FULL.items():
-            q, s = mx_quant(torch.randn(n, k, generator=g) * (0.01 if p == "down_proj" else 0.02))
+            q, s = mx_quant(
+                torch.randn(n, k, generator=g) * (0.01 if p == "down_proj" else 0.02)
+            )
             full[i, p] = mx_dequant(q, s).to(dev)
             wl[p, "weight"] = R.shard(q, p, "weight", rank, tp).contiguous()
-            wl[p, "weight_scale_inv"] = R.shard(s, p, "weight_scale_inv", rank, tp).contiguous()
+            wl[p, "weight_scale_inv"] = R.shard(
+                s, p, "weight_scale_inv", rank, tp
+            ).contiguous()
         weights.append(wl)
 
     def norm(n):
@@ -199,13 +211,18 @@ def main():
         )
         for i, n in enumerate(norms)
     ]
-    runner = R.DraftRunner(ns(layers=layers, norm=ns(weight=fin)), weights, rank, cpu, dev)
+    runner = R.DraftRunner(
+        ns(layers=layers, norm=ns(weight=fin)), weights, rank, cpu, dev
+    )
     # pages of 128 slots, page 0 the padding page; every rank's caches alike
     npages = 4096
     nslots = npages * 128
     gk = torch.Generator(device=dev).manual_seed(5)
     caches = [
-        tuple(torch.randn(nslots, 1, HD, generator=gk, device=dev).bfloat16() for _ in "kv")
+        tuple(
+            torch.randn(nslots, 1, HD, generator=gk, device=dev).bfloat16()
+            for _ in "kv"
+        )
         for _ in range(L)
     ]
     pool = ns(get_kv_buffer=lambda i: caches[i])
@@ -221,10 +238,16 @@ def main():
         perm = torch.randperm(npages - 1, generator=gs, device=dev) + 1
         for r in range(nreq):
             pages = perm[r * n : (r + 1) * n]
-            r2t[r + 1, : n * 128] = (pages[:, None] * 128 + torch.arange(128, device=dev)).flatten().int()
+            r2t[r + 1, : n * 128] = (
+                (pages[:, None] * 128 + torch.arange(128, device=dev)).flatten().int()
+            )
         rpi = torch.arange(1, nreq + 1, dtype=torch.int64, device=dev)
         seq = torch.full((nreq,), prefix, dtype=torch.int64, device=dev)
-        pos = torch.cat([torch.arange(prefix, prefix + Q) for _ in range(nreq)]).long().to(dev)
+        pos = (
+            torch.cat([torch.arange(prefix, prefix + Q) for _ in range(nreq)])
+            .long()
+            .to(dev)
+        )
         slots = torch.cat([r2t[r + 1, prefix : prefix + Q] for r in range(nreq)]).long()
         x = torch.randn(rows, H, generator=gs, device=dev).bfloat16()
         dist.broadcast(x, 0)
@@ -234,13 +257,17 @@ def main():
         out = runner.forward(x, pos, fb, backend).clone()
         torch.cuda.synchronize()
         new_rows = [(k[slots].clone(), v[slots].clone()) for k, v in caches]
-        ref, kv_rows = reference(x, pos, prefix, nreq, r2t, before, full, norms, fin, cos_sin, rank)
+        ref, kv_rows = reference(
+            x, pos, prefix, nreq, r2t, before, full, norms, fin, cos_sin, rank
+        )
         rel = ((out.float() - ref).norm() / ref.norm()).item()
         cos = torch.nn.functional.cosine_similarity(out.float(), ref, -1).min().item()
         kv_rel, stray = 0.0, 0
         for (k, v), (k0, v0), (kr, vr) in zip(caches, before, kv_rows):
             for c, c0, want in ((k, k0, kr), (v, v0, vr)):
-                kv_rel = max(kv_rel, ((c[slots, 0].float() - want).norm() / want.norm()).item())
+                kv_rel = max(
+                    kv_rel, ((c[slots, 0].float() - want).norm() / want.norm()).item()
+                )
                 changed = (c != c0).view(nslots, -1).any(1)
                 changed[slots] = False
                 stray += int(changed.sum())
@@ -268,7 +295,10 @@ def main():
             + (f" | window {'; '.join(edges) or 'kept'}" if prefix >= W else "")
         )
         if a.time:
-            st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            st, en = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
             st.record()
             for _ in range(20):
                 graph.replay()
