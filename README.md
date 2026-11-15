@@ -23,7 +23,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
 | Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP), and one launch a KDA layer in verify steps of 2 to 48 requests |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
-| MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
+| MiniMax-M3.1-Flash (NVFP4 experts) | MI350X, MI355X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 | Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 (MTP verify: 4) | Decode steps of up to 8 rows, and EAGLE/MTP target-verify steps of up to 8 requests x 4 draft tokens: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer in decode, three in verify). Attention, the MoE and the MTP draft run SGLang's kernels. See [its README](sgl_amd_mono/qwen35_a17b/README.md) |
 | Qwen3.8-2.4T-A95B (MXFP4 experts) | MI355X (gfx950) | 8 | All 92 layers in decode steps of up to 8 rows, and the layer tail (K2) of all 92 in NEXTN verify steps of up to 8 rows |
 | Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch |
@@ -44,7 +44,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
-- MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#45936](https://github.com/sgl-project/sglang/pull/45936)).
+- MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#46693](https://github.com/sgl-project/sglang/pull/46693)).
 - Qwen3.8-2.4T needs `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`: since [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839), SGLang quantizes the GDN projections to MXFP4 by default, and the kernels read them in bf16. It runs the fused shared expert (`--enforce-shared-experts-fusion`) in MXFP4 with [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899).
 
 ### Installation
@@ -321,7 +321,7 @@ pytest test/kernels -k "deepseek_v4 and not deepseek_v41"      # one MI355X: eve
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
-pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X or MI355X, MINIMAX_M31_FLASH_MODEL_PATH set
 pytest test/kernels -k qwen35_a17b_fp8                          # 1 x MI355X, no model needed: the verify GEMV and GDN chain
 pytest test/e2e -k qwen35_a17b_fp8                              # MI355X, QWEN35_FP8_MODEL_PATH set; QWEN35_FP8_TP=4 (default) or 8 for decode, MTP at TP4
 pytest test/kernels test/e2e -k qwen38_a95b_mxfp4               # 8 x MI355X, QWEN38_A95B_MXFP4_MODEL_PATH set: K1 on 1 GPU, K2 on 8, server at TP8
@@ -330,6 +330,8 @@ pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or 
 ```
 
 Kernel-only time of a DeepSeek-V4.1-Flash layer: `torchrun --nproc-per-node 4 test/kernels/deepseek_v41/time_layer.py --widths 6,12`.
+
+Kernel-only time of the MiniMax-M3.1-Flash FFN launch (no model needed): `torchrun --nproc-per-node 4 test/kernels/minimax_m31/time_ffn.py --widths 8,16 --experts 22,37` (the distinct routed experts a launch of real traffic routes at 8 and 16 rows).
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).
 
