@@ -100,6 +100,38 @@ SGLANG_READS = {
         "nvfp4_layer_caches",
     ),
     "srt/mem_cache/minimax_m3_nvfp4_pool.py": ("MiniMaxM3Nvfp4KVPool",),
+    "srt/model_executor/forward_context.py": ("get_forward_context", "attn_backend"),
+    "srt/layers/attention/minimax_sparse_backend.py": (
+        "sparse",
+        "_linear_verify_meta",
+        "kv_is_nvfp4",
+        "speculative_num_draft_tokens",
+        "use_dense_sparse_decode",
+        "_use_msa_decode",
+        "hisparse_coordinator",
+        "indexer_cp",
+        "fp8_attn_gemm",
+        "index_cache_enabled",
+        "score_type",
+        "block_size_k",
+        "page_size",
+        "topk_blocks",
+        "init_blocks",
+        "local_blocks",
+        "req_to_token",
+        "_max_seqlen_k",
+        "seq_lens",
+        "req_pool_indices",
+    ),
+    "srt/layers/attention/minimax_sparse_ops/minimax_sparse.py": ("minimax_sparse_decode",),
+    "srt/layers/radix_attention.py": (
+        "q_scale_float",
+        "k_scale_float",
+        "v_scale_float",
+        "idx_q_scale_float",
+        "idx_k_scale_float",
+        "idx_v_scale_float",
+    ),
     "srt/layers/rotary_embedding/base.py": ("cos_sin_cache", "is_neox_style"),
     "srt/distributed/parallel_state.py": ("get_tp_group", "rank_in_group", "cpu_group"),
     "srt/runtime_context.py": ("get_parallel",),
@@ -361,7 +393,9 @@ def _front_weights(layer):
 class _Built:
     """One rank's FFN launcher, every sparse layer's weights, and the forward."""
 
-    def __init__(self, lm, runner, peer, weights: dict, sparse: list[int], front=None):
+    def __init__(
+        self, lm, runner, peer, weights: dict, sparse: list[int], front=None, index=None
+    ):
         self.lm, self.model = lm, lm.model
         self.runner, self.peer, self.weights = runner, peer, weights
         self.first, self.sparse = sparse[0], sparse
@@ -369,6 +403,8 @@ class _Built:
         # (FrontRunner, {layer: weights}) for the sparse layers past the first
         self.front = front
         self._front_caches: dict[int, tuple] = {}
+        # the verify indexer launch (IndexRunner) under the front, or None
+        self.index = index
 
     def _front_pool(self, layer, lid):
         """Layer lid's write views of SGLang's NVFP4 pool, or None off it."""
@@ -406,6 +442,9 @@ class _Built:
         )
         if getattr(layer, "_is_layer_to_capture", False):
             aux.capture(res_new)
+        sparse = self._verify_backend(forward_batch, q.shape[0])
+        if sparse is not None:
+            return self._attend(layer, q, iq, caches, sparse), res_new
         attn._mark_sparse_kv_cached_by_fusion(forward_batch, attn.attn.layer_id)
         # K, V and index K: the attention reads the pool rows, not these
         unused = q[:, : attn.head_dim]
@@ -413,6 +452,81 @@ class _Built:
         with _o_proj_input(attn.o_proj):
             out_attn = attn.forward_core((None, forward_batch, inner))
         return out_attn, res_new
+
+    def _verify_backend(self, forward_batch, rows):
+        """SGLang's sparse attention backend when this step's top-k runs as the
+        plugin's indexer launch (``index.py``): a linear DSpark verify of 8-row
+        requests whose top-k SGLang computes per layer with the max score."""
+        if self.index is None or not forward_batch.forward_mode.is_target_verify():
+            return None
+        from sglang.srt.model_executor.forward_context import get_forward_context
+
+        backend = get_forward_context().attn_backend
+        sparse = getattr(backend, "sparse", backend)
+        meta = getattr(sparse, "_linear_verify_meta", None)
+        if (
+            meta is None
+            or not getattr(sparse, "kv_is_nvfp4", False)
+            or sparse.speculative_num_draft_tokens != 8
+            or rows % 8 or not 1 <= rows // 8 <= 2
+            or meta.seq_lens.shape[0] != rows
+            or sparse.use_dense_sparse_decode
+            or sparse._use_msa_decode
+            or sparse.hisparse_coordinator is not None
+            or sparse.indexer_cp is not None
+            or sparse.fp8_attn_gemm
+            or sparse.index_cache_enabled
+            or sparse.score_type != "max"
+            or (sparse.block_size_k, sparse.page_size, sparse.topk_blocks) != (128, 128, 16)
+            or (sparse.init_blocks, sparse.local_blocks) != (0, 1)
+        ):
+            return None
+        return sparse
+
+    def _attend(self, layer, q, iq, caches, sparse):
+        """Layer's sparse attention on the step's Q and index Q: the indexer launch's
+        top-k, then SGLang's NVFP4 sparse decode on it (``cached_topk_idx`` skips
+        SGLang's own scoring and top-k)."""
+        from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+            minimax_sparse_decode,
+        )
+
+        a = layer.self_attn.attn
+        meta = sparse._linear_verify_meta
+        rows = q.shape[0]
+        k, v, ik = caches
+        topk = self.index(iq, ik, sparse.req_to_token, meta.seq_lens, meta.req_pool_indices)
+        _, o = minimax_sparse_decode(
+            q.view(rows, -1, 128),
+            None,
+            k,
+            v,
+            iq.view(rows, 1, 128),
+            None,
+            ik,
+            None,
+            sparse.req_to_token,
+            meta.req_pool_indices,
+            meta.seq_lens,
+            sparse._max_seqlen_k,
+            1,
+            sparse.block_size_k,
+            sparse.topk_blocks,
+            sparse.init_blocks,
+            sparse.local_blocks,
+            score_type=sparse.score_type,
+            disable_index_value=True,
+            page_size=sparse.page_size,
+            q_scale=a.q_scale_float,
+            k_scale=a.k_scale_float,
+            v_scale=a.v_scale_float,
+            idx_q_scale=a.idx_q_scale_float,
+            idx_k_scale=a.idx_k_scale_float,
+            idx_v_scale=a.idx_v_scale_float,
+            cached_topk_idx=topk,
+            packed_queries=sparse.speculative_num_draft_tokens,
+        )
+        return o.reshape(rows, -1)
 
     def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
         lm = self.lm
@@ -592,7 +706,13 @@ def build(model, hf_config, ctx):
                 {i: _front_weights(model.model.layers[i]) for i in sparse[1:]},
             )
             logger.info("M3.1 attention front launch: layers %d .. %d", sparse[1], sparse[-1])
-    return _Built(model, runner, peer, weights, sparse, front)
+    index = None
+    if front is not None and os.environ.get("SGLANG_AMD_MONO_M31_INDEX", "1") == "1":
+        from sgl_amd_mono.minimax_m31.runner import IndexRunner
+
+        index = IndexRunner(device)
+        logger.info("M3.1 verify indexer launch under the front")
+    return _Built(model, runner, peer, weights, sparse, front, index)
 
 
 # check mode, 2 runs of 16 GSM8K prompts (49,476 and 44,004 launches); worst case:
